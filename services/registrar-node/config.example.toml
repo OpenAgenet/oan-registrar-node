@@ -1,0 +1,34 @@
+[server]
+host = "127.0.0.1"
+port = 8001
+endpoint = "http://localhost:8001"
+
+[cors]
+allowed_origins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://openagenet.github.io",
+  "https://openagenet.github.io/oan-site",
+]
+
+[node]
+name = "Registrar Node"
+role = "registrar"
+did_semantic_code = "AGRG"
+
+[upstream]
+root_endpoint = "http://localhost:8000"
+
+[security.upstream]
+protocol_label = "ans-2026"
+root_did = "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
+
+[security.submit]
+max_in_flight = 32
+retry_after_seconds = 1
+upstream_timeout_ms = 15000
+
+[paths]
+data_dir = "../../data/registrar"
+records_dir = "../../data/registrar/resource-records"
+database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_registrar"

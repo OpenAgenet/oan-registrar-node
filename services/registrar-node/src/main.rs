@@ -1,0 +1,762 @@
+// Copyright (c) 2026 OpenAgenet contributors
+//
+// Initial author: JINLIANG XU
+// Email: jlxufly@gmail.com
+
+use anyhow::Result;
+use axum::{
+    extract::{Path as AxumPath, State},
+    http::{HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
+use oan_crypto::{hash_json_with_suite, signing_key_from_bytes, SigningKey};
+use oan_protocol::{
+    HealthResponse, ResourceRegistrationSubmission, ResourceVerifyAndPublishRequest,
+    OAN_RESOURCE_PROTOCOL_VERSION, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+    PURPOSE_VERIFY_AND_PUBLISH,
+};
+use oan_service_security::{
+    create_signed_request_envelope, request_id, request_nonce, SignedRequestEnvelopeInput,
+};
+use oan_storage::{
+    did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
+    SqliteJsonStore,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
+
+#[derive(Clone, Debug, Deserialize)]
+struct Config {
+    server: ServerConfig,
+    #[serde(default)]
+    cors: CorsConfig,
+    #[serde(default)]
+    security: SecurityConfig,
+    upstream: UpstreamConfig,
+    paths: PathConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ServerConfig {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct CorsConfig {
+    #[serde(default)]
+    allowed_origins: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpstreamConfig {
+    root_endpoint: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SecurityConfig {
+    #[serde(default)]
+    upstream: UpstreamSecurityConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct UpstreamSecurityConfig {
+    #[serde(default = "default_root_did")]
+    root_did: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PathConfig {
+    data_dir: PathBuf,
+    #[serde(default = "default_records_dir")]
+    records_dir: PathBuf,
+    #[serde(default = "default_keys_dir")]
+    keys_dir: PathBuf,
+    #[serde(default)]
+    database_url: Option<String>,
+}
+
+fn default_records_dir() -> PathBuf {
+    PathBuf::from("../../data/registrar/resource-records")
+}
+
+fn default_keys_dir() -> PathBuf {
+    PathBuf::from("../../data/registrar/keys")
+}
+
+fn default_root_did() -> String {
+    "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
+}
+
+#[derive(Clone)]
+struct AppState {
+    data: JsonStore,
+    config: Config,
+    did: String,
+    signing_key: SigningKey,
+    sqlite: Option<SqliteJsonStore>,
+    postgres: Option<PostgresJsonStore>,
+    client: reqwest::Client,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DevKeyFile {
+    algorithm: String,
+    #[serde(rename = "privateKeyJwk")]
+    private_key_jwk: PrivateKeyJwk,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PrivateKeyJwk {
+    d: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    error: String,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+fn crypto_suite_from_algorithm(value: &str) -> Result<CryptoSuite> {
+    match value {
+        "Ed25519" => Ok(CryptoSuite::Ed25519Sha256),
+        "SM2" => Ok(CryptoSuite::Sm2Sm3),
+        other => Err(anyhow::anyhow!("unsupported_algorithm: {other}")),
+    }
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn internal(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.into().to_string(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config_path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "services/registrar-node/config.example.toml".to_owned());
+    let config = load_config(config_path)?;
+    let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
+    let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
+    let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
+    let signing_key = signing_key_from_bytes(
+        crypto_suite,
+        &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
+    )?;
+    let (sqlite, postgres) = match config.paths.database_url.as_deref() {
+        Some(url) if !url.is_empty() => {
+            let database = DatabaseConfig::parse(url)?;
+            match database.backend() {
+                DatabaseBackend::Sqlite => {
+                    let sqlite = SqliteJsonStore::connect(url).await?;
+                    (Some(sqlite), None)
+                }
+                DatabaseBackend::Postgres => {
+                    let postgres = PostgresJsonStore::connect(url).await?;
+                    (None, Some(postgres))
+                }
+            }
+        }
+        _ => (None, None),
+    };
+    let state = AppState {
+        data: JsonStore::new(&config.paths.data_dir),
+        config: config.clone(),
+        did: did_doc.id,
+        signing_key,
+        sqlite,
+        postgres,
+        client: reqwest::Client::new(),
+    };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/registrar/did", get(registrar_did_document))
+        .route("/resources/register", post(register_resource))
+        .route("/resources/submit", post(register_resource))
+        .route("/registrar/status", get(api_status))
+        .route("/registrar/root-authorization", get(api_root_authorization))
+        .route("/resources", get(api_resources))
+        .route("/resources/{did}", get(api_resource_detail))
+        .route("/capability-tree", get(api_capability_tree))
+        .route("/capability-tags/suggest", post(api_suggest_tags))
+        .layer(build_cors_layer(&config.cors)?)
+        .with_state(state);
+
+    let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
+    println!("registrar-node listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn load_config(path: String) -> Result<Config> {
+    let path = PathBuf::from(path);
+    let mut config: Config = toml::from_str(&std::fs::read_to_string(&path)?)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
+    config.paths.records_dir = resolve_relative(base, &config.paths.records_dir);
+    config.paths.keys_dir = resolve_relative(base, &config.paths.keys_dir);
+    if let Some(database_url) = config.paths.database_url.as_mut() {
+        *database_url = resolve_database_url(base, database_url);
+    }
+    Ok(config)
+}
+
+fn resolve_relative(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn resolve_database_url(base: &Path, url: &str) -> String {
+    let Some(raw_path) = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+    else {
+        return url.to_owned();
+    };
+    let resolved = resolve_relative(base, Path::new(raw_path));
+    format!("sqlite:{}", resolved.display())
+}
+
+fn build_cors_layer(config: &CorsConfig) -> Result<CorsLayer> {
+    let origins: Vec<HeaderValue> = config
+        .allowed_origins
+        .iter()
+        .map(|origin| HeaderValue::from_str(origin))
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+        .allow_headers(AllowHeaders::any()))
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_owned(),
+        node_type: "registrar".to_owned(),
+        did: Some(state.did),
+    })
+}
+
+async fn registrar_did_document(State(state): State<AppState>) -> ApiResult<DidDocument> {
+    state
+        .data
+        .read("did-document.json")
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn register_resource(
+    State(state): State<AppState>,
+    Json(submission): Json<ResourceRegistrationSubmission>,
+) -> ApiResult<Value> {
+    submission.validate_shape().map_err(ApiError::bad_request)?;
+    let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
+    let response = state
+        .client
+        .post(format!(
+            "{}{}",
+            state.config.upstream.root_endpoint, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH
+        ))
+        .json(&request)
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(ApiError {
+            status,
+            message: body
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("root_resource_registration_failed")
+                .to_owned(),
+        });
+    }
+    let did_document_hash =
+        hash_json_with_suite(state.signing_key.crypto_suite(), &submission.did_document)
+            .map_err(ApiError::internal)?;
+    let record = json!({
+        "resourceDid": submission.resource_did,
+        "resourceType": submission.resource_type,
+        "packageVersion": submission.package_version,
+        "didDocumentHash": did_document_hash,
+        "metadataHash": submission.metadata_hash,
+        "packageHash": submission.package_hash,
+        "rootResponse": body,
+        "submittedAt": chrono::Utc::now()
+    });
+    write_resource_record(&state, &record).await?;
+    Ok(Json(json!({
+        "status": "submitted",
+        "resourceDid": record["resourceDid"],
+        "resourceType": record["resourceType"],
+        "rootResponse": record["rootResponse"]
+    })))
+}
+
+fn build_resource_verify_and_publish_request(
+    state: &AppState,
+    submission: ResourceRegistrationSubmission,
+) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
+    let envelope = create_signed_request_envelope(SignedRequestEnvelopeInput {
+        request_id: request_id("resource-verify-and-publish"),
+        protocol_version: OAN_RESOURCE_PROTOCOL_VERSION.to_owned(),
+        purpose: PURPOSE_VERIFY_AND_PUBLISH.to_owned(),
+        method: "POST".to_owned(),
+        path: PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH.to_owned(),
+        aud: state.config.security.upstream.root_did.clone(),
+        payload: &submission,
+        creator: state.did.clone(),
+        verification_method: format!("{}#key-1", state.did),
+        signing_key: &state.signing_key,
+        nonce: request_nonce("resource-verify-and-publish"),
+    })
+    .map_err(ApiError::internal)?;
+    Ok(ResourceVerifyAndPublishRequest {
+        registrar_did: state.did.clone(),
+        submission,
+        upstream_auth: envelope,
+    })
+}
+
+async fn write_resource_record(
+    state: &AppState,
+    record: &Value,
+) -> std::result::Result<(), ApiError> {
+    let did = record["resourceDid"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad_request("resource_did_missing"))?;
+    if let Some(sqlite) = &state.sqlite {
+        sqlite
+            .upsert_json("registrar.resource_records", did, record)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        postgres
+            .upsert_json("registrar.resource_records", did, record)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(());
+    }
+    state
+        .data
+        .write(
+            format!("resource-records/{}", did_to_file_name(did)),
+            record,
+        )
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn read_resource_records(state: &AppState) -> Result<Vec<Value>> {
+    if let Some(sqlite) = &state.sqlite {
+        return sqlite
+            .read_namespace("registrar.resource_records")
+            .await
+            .map_err(Into::into);
+    }
+    if let Some(postgres) = &state.postgres {
+        return postgres
+            .read_namespace("registrar.resource_records")
+            .await
+            .map_err(Into::into);
+    }
+    Ok(state
+        .data
+        .read("resource-records/index.json")
+        .unwrap_or_else(|_| {
+            let mut records = Vec::new();
+            if let Ok(entries) =
+                std::fs::read_dir(state.config.paths.data_dir.join("resource-records"))
+            {
+                for entry in entries.flatten() {
+                    if entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
+                        if let Ok(value) = JsonStore::new(".").read(entry.path()) {
+                            records.push(value);
+                        }
+                    }
+                }
+            }
+            records
+        }))
+}
+
+async fn read_resource_record(state: &AppState, did: &str) -> Result<Option<Value>> {
+    if let Some(sqlite) = &state.sqlite {
+        return sqlite
+            .read_json("registrar.resource_records", did)
+            .await
+            .map_err(Into::into);
+    }
+    if let Some(postgres) = &state.postgres {
+        return postgres
+            .read_json("registrar.resource_records", did)
+            .await
+            .map_err(Into::into);
+    }
+    Ok(state
+        .data
+        .read(format!("resource-records/{}", did_to_file_name(did)))
+        .ok())
+}
+
+async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
+    let records = read_resource_records(&state)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "registrarDid": state.did,
+        "rootEndpoint": state.config.upstream.root_endpoint,
+        "resourceRecordCount": records.len(),
+        "protocolVersion": OAN_RESOURCE_PROTOCOL_VERSION
+    })))
+}
+
+async fn api_root_authorization(State(state): State<AppState>) -> ApiResult<Value> {
+    let response = state
+        .client
+        .get(format!(
+            "{}/root/registrars/{}",
+            state.config.upstream.root_endpoint.trim_end_matches('/'),
+            state.did
+        ))
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => {
+            let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+            Ok(Json(json!({
+                "registrarDid": state.did,
+                "rootEndpoint": state.config.upstream.root_endpoint,
+                "rootReachable": true,
+                "authorization": body
+            })))
+        }
+        Ok(response) => Ok(Json(json!({
+            "registrarDid": state.did,
+            "rootEndpoint": state.config.upstream.root_endpoint,
+            "rootReachable": true,
+            "status": "unknown",
+            "rootStatusCode": response.status().as_u16()
+        }))),
+        Err(err) => Ok(Json(json!({
+            "registrarDid": state.did,
+            "rootEndpoint": state.config.upstream.root_endpoint,
+            "rootReachable": false,
+            "error": err.to_string()
+        }))),
+    }
+}
+
+async fn api_resources(State(state): State<AppState>) -> ApiResult<Value> {
+    let records = read_resource_records(&state)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "items": records, "count": records.len() })))
+}
+
+async fn api_resource_detail(
+    State(state): State<AppState>,
+    AxumPath(did): AxumPath<String>,
+) -> ApiResult<Value> {
+    let record = read_resource_record(&state, &did)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "resourceDid": did, "record": record })))
+}
+
+async fn api_capability_tree() -> ApiResult<Value> {
+    let tree = CapabilityTagTree::load_from_path("../../docs/capability-tree-v1.json").unwrap_or(
+        CapabilityTagTree {
+            version: 1,
+            tags: vec![],
+            tree: vec![],
+        },
+    );
+    Ok(Json(json!(tree)))
+}
+
+async fn api_suggest_tags(Json(payload): Json<Value>) -> ApiResult<Value> {
+    let text = payload["description"]
+        .as_str()
+        .or_else(|| payload["query"].as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let suggestions = if text.contains("contract") || text.contains("legal") {
+        vec!["legal.contract.review"]
+    } else if text.contains("mcp") {
+        vec!["protocol.mcp"]
+    } else if text.contains("api") || text.contains("tool") {
+        vec!["tool.api"]
+    } else {
+        vec!["general.resource"]
+    };
+    Ok(Json(json!({ "suggestions": suggestions })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::post, Router};
+    use chrono::{Duration, Utc};
+    use oan_core::{
+        OanMetadata, ProtocolBinding, ResourceDescription, ResourceType, ServiceEndpoint,
+        VerificationMethod,
+    };
+    use oan_crypto::{generate_ed25519_keypair, public_key_multibase, VerifyingKey};
+    use oan_protocol::{DidControlChallenge, SubjectControlProofBundle};
+    use tempfile::tempdir;
+
+    fn app_state(dir: &std::path::Path) -> AppState {
+        let key = generate_ed25519_keypair();
+        AppState {
+            data: JsonStore::new(dir),
+            config: Config {
+                server: ServerConfig {
+                    host: "127.0.0.1".to_owned(),
+                    port: 8002,
+                },
+                cors: CorsConfig::default(),
+                security: SecurityConfig {
+                    upstream: UpstreamSecurityConfig {
+                        root_did: "did:oan:AGRT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+                    },
+                },
+                upstream: UpstreamConfig {
+                    root_endpoint: "http://127.0.0.1:8001".to_owned(),
+                },
+                paths: PathConfig {
+                    data_dir: dir.to_path_buf(),
+                    records_dir: dir.join("records"),
+                    keys_dir: dir.join("keys"),
+                    database_url: None,
+                },
+            },
+            did: "did:oan:AGRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+            signing_key: SigningKey::Ed25519 {
+                suite: CryptoSuite::Ed25519Sha256,
+                key,
+            },
+            sqlite: None,
+            postgres: None,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn sample_document(did: &str) -> DidDocument {
+        let key = generate_ed25519_keypair();
+        let verifying_key = VerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.verifying_key(),
+        };
+        DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: did.to_owned(),
+            verification_method: vec![VerificationMethod {
+                id: format!("{did}#key-1"),
+                method_type: "Ed25519VerificationKey2020".to_owned(),
+                controller: did.to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                public_key_format: Some("multibase".to_owned()),
+                public_key_multibase: Some(public_key_multibase(&verifying_key)),
+                public_key_jwk: None,
+            }],
+            authentication: vec![format!("{did}#key-1")],
+            assertion_method: vec![format!("{did}#key-1")],
+            service: vec![ServiceEndpoint {
+                id: format!("{did}#download"),
+                service_type: "SkillPackageDownload".to_owned(),
+                service_endpoint: "https://example.org/skill.json".to_owned(),
+                version: Some("1".to_owned()),
+                protocol: Some("https".to_owned()),
+                server_type: None,
+                port: None,
+            }],
+            oan_metadata: Some(OanMetadata {
+                subject_type: ResourceType::Skill,
+                resource_type: ResourceType::Skill,
+                node_role: None,
+                identity_type: None,
+                controller_did: None,
+                publisher_did: None,
+                issuer_did: None,
+                ttl: None,
+                resource_description: Some(ResourceDescription {
+                    name: Some("Contract Skill".to_owned()),
+                    description: Some("Review contracts".to_owned()),
+                    capability_tags: vec!["legal.contract.review".to_owned()],
+                    ..Default::default()
+                }),
+                agent_description: None,
+                capability_tags: vec!["legal.contract.review".to_owned()],
+                protocol_bindings: vec![ProtocolBinding {
+                    id: format!("{did}#binding-https"),
+                    protocol: "https".to_owned(),
+                    version: None,
+                    transport: Some("http".to_owned()),
+                    service_ref: Some(format!("{did}#download")),
+                    schema_ref: None,
+                    extra: Default::default(),
+                }],
+                implementation_links: vec![],
+                credential_requirements: vec![],
+                package_info: None,
+                service_policy: None,
+                network_scope: None,
+                lifecycle_state: Some("active".to_owned()),
+                extra: Default::default(),
+            }),
+        }
+    }
+
+    fn sample_submission() -> ResourceRegistrationSubmission {
+        let did = "did:oan:SKLG:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
+        let document = sample_document(did);
+        let did_document_hash =
+            hash_json_with_suite(CryptoSuite::Ed25519Sha256, &document).unwrap();
+        ResourceRegistrationSubmission {
+            resource_did: did.to_owned(),
+            resource_type: ResourceType::Skill,
+            did_document: document,
+            did_document_hash: format!("sha256:{did_document_hash}"),
+            metadata: json!({"name": "Contract Skill", "description": "Review contracts"}),
+            package_version: "1".to_owned(),
+            package_hash: "sha256:placeholder-package".to_owned(),
+            metadata_hash: "sha256:placeholder-metadata".to_owned(),
+            hash_algorithm: "sha256".to_owned(),
+            registration_credential: json!({"status": "active"}),
+            subject_control_proof: SubjectControlProofBundle {
+                challenge: DidControlChallenge {
+                    challenge_id: "challenge-1".to_owned(),
+                    draft_id: "resource-draft-1".to_owned(),
+                    subject_did: did.to_owned(),
+                    did_document_hash: format!("sha256:{did_document_hash}"),
+                    registrar_did: "did:oan:AGRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+                    purpose: "resource-registration".to_owned(),
+                    verification_method: format!("{did}#key-1"),
+                    nonce: "nonce-1".to_owned(),
+                    issued_at: Utc::now(),
+                    expires_at: Utc::now() + Duration::seconds(300),
+                },
+                proof: oan_core::DataIntegrityProof {
+                    proof_type: "DataIntegrityProof".to_owned(),
+                    creator: format!("{did}#key-1"),
+                    created: Utc::now(),
+                    proof_purpose: "assertionMethod".to_owned(),
+                    proof_value: "proof".to_owned(),
+                    crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                    hash_algorithm: Some("sha256".to_owned()),
+                    verification_method: Some(format!("{did}#key-1")),
+                },
+                verified_at: Some(Utc::now()),
+                verified_verification_method: Some(format!("{did}#key-1")),
+                proof_hash: Some("proof-hash".to_owned()),
+            },
+        }
+    }
+
+    #[test]
+    fn build_resource_verify_request_uses_resource_contract() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let request =
+            build_resource_verify_and_publish_request(&state, sample_submission()).unwrap();
+        assert_eq!(
+            request.upstream_auth.path,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH
+        );
+        assert_eq!(request.upstream_auth.purpose, PURPOSE_VERIFY_AND_PUBLISH);
+        assert!(request.submission.resource_did.starts_with("did:oan:"));
+    }
+
+    #[tokio::test]
+    async fn register_resource_posts_to_root_and_records_resource() {
+        async fn handler(Json(request): Json<ResourceVerifyAndPublishRequest>) -> Json<Value> {
+            Json(json!({
+                "status": "resource-verified-and-queued",
+                "resourceDid": request.submission.resource_did
+            }))
+        }
+        let app = Router::new().route(PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        state.config.upstream.root_endpoint = format!("http://{addr}");
+        let submission = sample_submission();
+        let response = register_resource(State(state.clone()), Json(submission.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.0["status"], "submitted");
+        assert_eq!(response.0["resourceDid"], submission.resource_did);
+        let stored = read_resource_record(&state, &submission.resource_did)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["resourceDid"], submission.resource_did);
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_did_ans_resource() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let mut submission = sample_submission();
+        submission.resource_did = "did:ans:SKLG:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
+        submission.did_document.id = submission.resource_did.clone();
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+}

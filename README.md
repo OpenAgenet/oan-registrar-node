@@ -1,0 +1,22 @@
+# OAN Registrar Node
+
+Registrar service workspace for OpenAgenet.
+
+This repository owns:
+
+- `registrar-node`
+
+Shared protocol, crypto, storage, and service-security crates live in the
+sibling `oan-protocol-common` repository.
+
+## Local Checks
+
+```powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace -j 1
+```
+
+Integration tests and benchmarks are run from `oan-examples`. Service-node
+identity material is copied from `oan-design-docs/genesis/nodes` into per-run
+work directories; this repository does not own genesis private material.

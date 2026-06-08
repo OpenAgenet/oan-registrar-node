@@ -1,0 +1,30 @@
+﻿[package]
+name = "registrar-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+oan-core.workspace = true
+oan-credentials.workspace = true
+oan-crypto.workspace = true
+oan-protocol.workspace = true
+oan-service-security.workspace = true
+oan-storage.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-http.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
