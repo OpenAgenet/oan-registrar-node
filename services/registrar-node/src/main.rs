@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
+use oan_credentials::sign_credential;
 use oan_crypto::{hash_json_with_suite, signing_key_from_bytes, SigningKey};
 use oan_protocol::{
     HealthResponse, ResourceRegistrationSubmission, ResourceVerifyAndPublishRequest,
@@ -320,6 +321,8 @@ async fn register_resource(
     let did_document_hash =
         hash_json_with_suite(state.signing_key.crypto_suite(), &submission.did_document)
             .map_err(ApiError::internal)?;
+    let registration_credential =
+        issue_resource_registration_credential(&state, &submission, &did_document_hash)?;
     let record = json!({
         "resourceDid": submission.resource_did,
         "resourceType": submission.resource_type,
@@ -327,6 +330,7 @@ async fn register_resource(
         "didDocumentHash": did_document_hash,
         "metadataHash": submission.metadata_hash,
         "packageHash": submission.package_hash,
+        "registrationCredential": registration_credential,
         "rootResponse": body,
         "submittedAt": chrono::Utc::now()
     });
@@ -335,6 +339,7 @@ async fn register_resource(
         "status": "submitted",
         "resourceDid": record["resourceDid"],
         "resourceType": record["resourceType"],
+        "registrationCredential": record["registrationCredential"],
         "rootResponse": record["rootResponse"]
     })))
 }
@@ -343,6 +348,8 @@ fn build_resource_verify_and_publish_request(
     state: &AppState,
     submission: ResourceRegistrationSubmission,
 ) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
+    let mut root_submission = submission;
+    root_submission.registration_credential = Value::Null;
     let envelope = create_signed_request_envelope(SignedRequestEnvelopeInput {
         request_id: request_id("resource-verify-and-publish"),
         protocol_version: OAN_RESOURCE_PROTOCOL_VERSION.to_owned(),
@@ -350,7 +357,7 @@ fn build_resource_verify_and_publish_request(
         method: "POST".to_owned(),
         path: PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH.to_owned(),
         aud: state.config.security.upstream.root_did.clone(),
-        payload: &submission,
+        payload: &root_submission,
         creator: state.did.clone(),
         verification_method: format!("{}#key-1", state.did),
         signing_key: &state.signing_key,
@@ -359,9 +366,50 @@ fn build_resource_verify_and_publish_request(
     .map_err(ApiError::internal)?;
     Ok(ResourceVerifyAndPublishRequest {
         registrar_did: state.did.clone(),
-        submission,
+        submission: root_submission,
         upstream_auth: envelope,
     })
+}
+
+fn issue_resource_registration_credential(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+    did_document_hash: &str,
+) -> std::result::Result<Value, ApiError> {
+    let issued_at = chrono::Utc::now();
+    let key_id = format!("{}#key-1", state.did);
+    let mut credential = json!({
+        "@context": [
+            "https://www.w3.org/2018/credentials/v1",
+            "https://openagenet.org/credentials/v1"
+        ],
+        "id": format!("urn:oan:credential:resource-registration:{}", did_to_file_name(&submission.resource_did).trim_end_matches(".json")),
+        "type": [
+            "VerifiableCredential",
+            "OANResourceRegistrationCredential"
+        ],
+        "issuer": state.did,
+        "issuanceDate": issued_at,
+        "credentialSubject": {
+            "id": submission.resource_did,
+            "resourceDid": submission.resource_did,
+            "resourceType": submission.resource_type,
+            "didDocumentHash": did_document_hash,
+            "metadataHash": submission.metadata_hash,
+            "packageHash": submission.package_hash,
+            "packageVersion": submission.package_version,
+            "hashAlgorithm": submission.hash_algorithm,
+            "lifecycleState": submission.metadata["lifecycleState"].as_str().unwrap_or("active")
+        },
+        "credentialStatus": {
+            "type": "OANResourceRegistrationStatus",
+            "status": "active"
+        }
+    });
+    let proof = sign_credential(&credential, key_id.clone(), key_id, &state.signing_key)
+        .map_err(ApiError::internal)?;
+    credential["proof"] = serde_json::to_value(proof).map_err(ApiError::internal)?;
+    Ok(credential)
 }
 
 async fn write_resource_record(
@@ -719,6 +767,7 @@ mod tests {
     #[tokio::test]
     async fn register_resource_posts_to_root_and_records_resource() {
         async fn handler(Json(request): Json<ResourceVerifyAndPublishRequest>) -> Json<Value> {
+            assert!(request.submission.registration_credential.is_null());
             Json(json!({
                 "status": "resource-verified-and-queued",
                 "resourceDid": request.submission.resource_did
@@ -740,11 +789,21 @@ mod tests {
             .unwrap();
         assert_eq!(response.0["status"], "submitted");
         assert_eq!(response.0["resourceDid"], submission.resource_did);
+        assert_eq!(
+            response.0["registrationCredential"]["issuer"],
+            state.did.clone()
+        );
+        assert_eq!(
+            response.0["registrationCredential"]["credentialSubject"]["resourceDid"],
+            submission.resource_did
+        );
+        assert!(response.0["registrationCredential"]["proof"]["proofValue"].is_string());
         let stored = read_resource_record(&state, &submission.resource_did)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored["resourceDid"], submission.resource_did);
+        assert!(stored["registrationCredential"]["proof"]["proofValue"].is_string());
     }
 
     #[tokio::test]
