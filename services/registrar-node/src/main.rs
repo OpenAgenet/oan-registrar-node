@@ -295,6 +295,8 @@ async fn register_resource(
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
+    let authorized_domains =
+        validate_resource_authorized_domains_for_registrar(&state, &submission)?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
     let response = state
         .client
@@ -330,6 +332,7 @@ async fn register_resource(
         "didDocumentHash": did_document_hash,
         "metadataHash": submission.metadata_hash,
         "packageHash": submission.package_hash,
+        "authorizedDomains": authorized_domains,
         "registrationCredential": registration_credential,
         "rootResponse": body,
         "submittedAt": chrono::Utc::now()
@@ -342,6 +345,117 @@ async fn register_resource(
         "registrationCredential": record["registrationCredential"],
         "rootResponse": record["rootResponse"]
     })))
+}
+
+fn validate_resource_authorized_domains_for_registrar(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+) -> std::result::Result<Vec<String>, ApiError> {
+    let registrar_document: DidDocument = state
+        .data
+        .read("did-document.json")
+        .map_err(ApiError::internal)?;
+    let registrar_domains = registrar_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
+    let resource_domains = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
+
+    if let Some(metadata_domains) = submission
+        .metadata
+        .get("authorizedDomains")
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .map(|domain| {
+                    domain
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| "invalid_authorized_domains".to_owned())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(ApiError::bad_request)?
+    {
+        if metadata_domains != resource_domains {
+            return Err(ApiError::bad_request("authorized_domains_mismatch"));
+        }
+    }
+
+    validate_resource_authorized_domains(&resource_domains, &registrar_domains)
+        .map_err(ApiError::bad_request)?;
+    Ok(resource_domains)
+}
+
+fn validate_authorized_domain_list(domains: &[String]) -> std::result::Result<(), String> {
+    if domains.iter().any(|domain| domain == "*") {
+        return if domains.len() == 1 {
+            Ok(())
+        } else {
+            Err("invalid_authorized_domains".to_owned())
+        };
+    }
+    for domain in domains {
+        if domain.trim().is_empty()
+            || domain != domain.trim()
+            || domain.contains("..")
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+        {
+            return Err("invalid_authorized_domains".to_owned());
+        }
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("invalid_authorized_domains".to_owned());
+    }
+    Ok(())
+}
+
+fn authorized_domain_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || requested
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn authorized_domains_cover(granted: &[String], requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    if granted.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if granted.is_empty() {
+        return false;
+    }
+    requested.iter().all(|requested_domain| {
+        granted
+            .iter()
+            .any(|granted_domain| authorized_domain_covers(granted_domain, requested_domain))
+    })
+}
+
+fn validate_resource_authorized_domains(
+    resource_domains: &[String],
+    registrar_domains: &[String],
+) -> std::result::Result<(), String> {
+    if resource_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(resource_domains)?;
+    validate_authorized_domain_list(registrar_domains)?;
+    if !authorized_domains_cover(registrar_domains, resource_domains) {
+        return Err("unauthorized_domains".to_owned());
+    }
+    Ok(())
 }
 
 fn build_resource_verify_and_publish_request(
@@ -378,6 +492,12 @@ fn issue_resource_registration_credential(
 ) -> std::result::Result<Value, ApiError> {
     let issued_at = chrono::Utc::now();
     let key_id = format!("{}#key-1", state.did);
+    let authorized_domains = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
     let mut credential = json!({
         "@context": [
             "https://www.w3.org/2018/credentials/v1",
@@ -399,6 +519,7 @@ fn issue_resource_registration_credential(
             "packageHash": submission.package_hash,
             "packageVersion": submission.package_version,
             "hashAlgorithm": submission.hash_algorithm,
+            "authorizedDomains": authorized_domains,
             "lifecycleState": submission.metadata["lifecycleState"].as_str().unwrap_or("active")
         },
         "credentialStatus": {
@@ -684,6 +805,7 @@ mod tests {
                 }),
                 agent_description: None,
                 capability_tags: vec!["legal.contract.review".to_owned()],
+                authorized_domains: vec!["legal".to_owned()],
                 protocol_bindings: vec![ProtocolBinding {
                     id: format!("{did}#binding-https"),
                     protocol: "https".to_owned(),
@@ -750,6 +872,24 @@ mod tests {
         }
     }
 
+    fn write_registrar_document(state: &AppState, domains: Vec<String>) {
+        let mut document = sample_document(&state.did);
+        document.oan_metadata.as_mut().unwrap().authorized_domains = domains;
+        state.data.write("did-document.json", &document).unwrap();
+    }
+
+    fn set_submission_domains(
+        submission: &mut ResourceRegistrationSubmission,
+        domains: Vec<String>,
+    ) {
+        submission
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .authorized_domains = domains;
+    }
+
     #[test]
     fn build_resource_verify_request_uses_resource_contract() {
         let dir = tempdir().unwrap();
@@ -782,6 +922,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
         let submission = sample_submission();
         let response = register_resource(State(state.clone()), Json(submission.clone()))
@@ -797,13 +938,105 @@ mod tests {
             response.0["registrationCredential"]["credentialSubject"]["resourceDid"],
             submission.resource_did
         );
+        assert_eq!(
+            response.0["registrationCredential"]["credentialSubject"]["authorizedDomains"],
+            json!(["legal"])
+        );
         assert!(response.0["registrationCredential"]["proof"]["proofValue"].is_string());
         let stored = read_resource_record(&state, &submission.resource_did)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored["resourceDid"], submission.resource_did);
+        assert_eq!(stored["authorizedDomains"], json!(["legal"]));
         assert!(stored["registrationCredential"]["proof"]["proofValue"].is_string());
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_domains_outside_registrar_grant_before_root_call() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["legal".to_owned()]);
+        state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
+        let mut submission = sample_submission();
+        set_submission_domains(&mut submission, vec!["finance".to_owned()]);
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "unauthorized_domains");
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_missing_resource_domains_before_root_call() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["*".to_owned()]);
+        state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
+        let mut submission = sample_submission();
+        set_submission_domains(&mut submission, vec![]);
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "resource_domains_required");
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_metadata_authorized_domains_mismatch() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["*".to_owned()]);
+        state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
+        let mut submission = sample_submission();
+        submission.metadata = json!({
+            "name": "Contract Skill",
+            "description": "Review contracts",
+            "authorizedDomains": ["finance"]
+        });
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "authorized_domains_mismatch");
+    }
+
+    #[tokio::test]
+    async fn wildcard_registrar_accepts_concrete_resource_domains() {
+        async fn handler(Json(request): Json<ResourceVerifyAndPublishRequest>) -> Json<Value> {
+            Json(json!({
+                "status": "resource-verified-and-queued",
+                "resourceDid": request.submission.resource_did
+            }))
+        }
+        let app = Router::new().route(PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["*".to_owned()]);
+        state.config.upstream.root_endpoint = format!("http://{addr}");
+        let mut submission = sample_submission();
+        set_submission_domains(&mut submission, vec!["finance.payments".to_owned()]);
+
+        let response = register_resource(State(state), Json(submission))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.0["registrationCredential"]["credentialSubject"]["authorizedDomains"],
+            json!(["finance.payments"])
+        );
     }
 
     #[tokio::test]
