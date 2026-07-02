@@ -15,6 +15,7 @@ oan-core.workspace = true
 oan-credentials.workspace = true
 oan-crypto.workspace = true
 oan-protocol.workspace = true
+oan-semantic-recommender.workspace = true
 oan-service-security.workspace = true
 oan-storage.workspace = true
 reqwest.workspace = true

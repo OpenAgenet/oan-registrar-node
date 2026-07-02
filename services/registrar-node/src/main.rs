@@ -20,6 +20,10 @@ use oan_protocol::{
     OAN_RESOURCE_PROTOCOL_VERSION, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
     PURPOSE_VERIFY_AND_PUBLISH,
 };
+use oan_semantic_recommender::{
+    normalize_capability_tags, RegistrationSuggestionContext, RegistrationSuggestionInput,
+    SemanticRecommender,
+};
 use oan_service_security::{
     create_signed_request_envelope, request_id, request_nonce, SignedRequestEnvelopeInput,
 };
@@ -33,6 +37,7 @@ use std::{
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
@@ -108,6 +113,7 @@ struct AppState {
     sqlite: Option<SqliteJsonStore>,
     postgres: Option<PostgresJsonStore>,
     client: reqwest::Client,
+    recommender: Arc<SemanticRecommender>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -208,6 +214,7 @@ async fn main() -> Result<()> {
         sqlite,
         postgres,
         client: reqwest::Client::new(),
+        recommender: Arc::new(SemanticRecommender::new()?),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -220,6 +227,15 @@ async fn main() -> Result<()> {
         .route("/resources/{did}", get(api_resource_detail))
         .route("/capability-tree", get(api_capability_tree))
         .route("/capability-tags/suggest", post(api_suggest_tags))
+        .route("/capability-tags/normalize", post(api_normalize_tags))
+        .route(
+            "/registration/domain-catalog",
+            get(api_registration_domain_catalog),
+        )
+        .route(
+            "/registration/suggestions",
+            post(api_registration_suggestions),
+        )
         .layer(build_cors_layer(&config.cors)?)
         .with_state(state);
 
@@ -692,22 +708,132 @@ async fn api_capability_tree() -> ApiResult<Value> {
     Ok(Json(json!(tree)))
 }
 
-async fn api_suggest_tags(Json(payload): Json<Value>) -> ApiResult<Value> {
+async fn api_suggest_tags(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> ApiResult<Value> {
     let text = payload["description"]
         .as_str()
         .or_else(|| payload["query"].as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let suggestions = if text.contains("contract") || text.contains("legal") {
-        vec!["legal.contract.review"]
-    } else if text.contains("mcp") {
-        vec!["protocol.mcp"]
-    } else if text.contains("api") || text.contains("tool") {
-        vec!["tool.api"]
-    } else {
-        vec!["general.resource"]
+        .unwrap_or("");
+    let input = RegistrationSuggestionInput {
+        resource_type: None,
+        name: payload["name"].as_str().unwrap_or("").to_owned(),
+        description: text.to_owned(),
+        endpoint: payload["endpoint"].as_str().map(ToOwned::to_owned),
+        manifest_text: payload["manifestText"].as_str().map(ToOwned::to_owned),
+        schema_text: payload["schemaText"].as_str().map(ToOwned::to_owned),
+        locale: payload["locale"].as_str().map(ToOwned::to_owned),
     };
-    Ok(Json(json!({ "suggestions": suggestions })))
+    let result = state
+        .recommender
+        .suggest_registration_metadata(input, registration_suggestion_context(&state)?)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let suggestions = result
+        .capability_tags
+        .iter()
+        .map(|tag| tag.value.clone())
+        .collect::<Vec<_>>();
+    Ok(Json(
+        json!({ "suggestions": suggestions, "capabilityTags": result.capability_tags }),
+    ))
+}
+
+async fn api_normalize_tags(Json(payload): Json<Value>) -> ApiResult<Value> {
+    let tags = payload["tags"]
+        .as_array()
+        .or_else(|| payload["capabilityTags"].as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let normalized = normalize_capability_tags(&tags);
+    Ok(Json(json!({
+        "tags": normalized,
+        "capabilityTags": normalized
+    })))
+}
+
+async fn api_registration_domain_catalog(State(state): State<AppState>) -> ApiResult<Value> {
+    let registrar_domains = registrar_authorized_domains(&state)?;
+    let domains = state
+        .recommender
+        .taxonomy()
+        .domains
+        .iter()
+        .filter(|domain| {
+            domain_covered_by_scope(&state, &domain.id, &registrar_domains).unwrap_or(false)
+        })
+        .map(|domain| {
+            json!({
+                "id": domain.id,
+                "label": domain.label,
+                "aliases": domain.aliases,
+                "selectable": true
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "registrarDid": state.did,
+        "authorizedDomains": registrar_domains,
+        "catalogVersion": state.recommender.taxonomy().version,
+        "snapshotHash": state.recommender.taxonomy().snapshot_hash,
+        "domains": domains
+    })))
+}
+
+async fn api_registration_suggestions(
+    State(state): State<AppState>,
+    Json(payload): Json<RegistrationSuggestionInput>,
+) -> ApiResult<Value> {
+    let result = state
+        .recommender
+        .suggest_registration_metadata(payload, registration_suggestion_context(&state)?)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    Ok(Json(
+        serde_json::to_value(result).map_err(ApiError::internal)?,
+    ))
+}
+
+fn registration_suggestion_context(
+    state: &AppState,
+) -> std::result::Result<RegistrationSuggestionContext, ApiError> {
+    Ok(RegistrationSuggestionContext {
+        registrar_did: state.did.clone(),
+        allowed_domains: registrar_authorized_domains(state)?,
+        max_authorized_domain_candidates: 8,
+        max_capability_tag_candidates: 12,
+    })
+}
+
+fn registrar_authorized_domains(state: &AppState) -> std::result::Result<Vec<String>, ApiError> {
+    let registrar_document: DidDocument = state
+        .data
+        .read("did-document.json")
+        .map_err(ApiError::internal)?;
+    Ok(registrar_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default())
+}
+
+fn domain_covered_by_scope(
+    state: &AppState,
+    domain: &str,
+    scope: &[String],
+) -> std::result::Result<bool, ApiError> {
+    if scope.iter().any(|item| item == "*") {
+        return Ok(true);
+    }
+    Ok(state
+        .recommender
+        .taxonomy()
+        .covers_authorized_domains(&[domain.to_owned()], scope))
 }
 
 #[cfg(test)]
@@ -756,6 +882,7 @@ mod tests {
             sqlite: None,
             postgres: None,
             client: reqwest::Client::new(),
+            recommender: Arc::new(SemanticRecommender::new().unwrap()),
         }
     }
 
@@ -902,6 +1029,34 @@ mod tests {
         );
         assert_eq!(request.upstream_auth.purpose, PURPOSE_VERIFY_AND_PUBLISH);
         assert!(request.submission.resource_did.starts_with("did:oan:"));
+    }
+
+    #[tokio::test]
+    async fn normalize_tags_accepts_sdk_and_legacy_payload_shapes() {
+        let sdk_response = api_normalize_tags(Json(json!({
+            "tags": [" Protocol MCP ", "security audit", "protocol-mcp"]
+        })))
+        .await
+        .unwrap();
+        assert_eq!(
+            sdk_response.0["tags"],
+            json!(["protocol-mcp", "security-audit"])
+        );
+        assert_eq!(
+            sdk_response.0["capabilityTags"],
+            json!(["protocol-mcp", "security-audit"])
+        );
+
+        let legacy_response = api_normalize_tags(Json(json!({
+            "capabilityTags": [" Contract Review ", "contract-review"]
+        })))
+        .await
+        .unwrap();
+        assert_eq!(legacy_response.0["tags"], json!(["contract-review"]));
+        assert_eq!(
+            legacy_response.0["capabilityTags"],
+            json!(["contract-review"])
+        );
     }
 
     #[tokio::test]
