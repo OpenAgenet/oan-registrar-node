@@ -11,6 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::{DateTime, Datelike, Utc};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
 use oan_credentials::sign_credential;
@@ -222,6 +223,7 @@ async fn main() -> Result<()> {
         .route("/resources/register", post(register_resource))
         .route("/resources/submit", post(register_resource))
         .route("/registrar/status", get(api_status))
+        .route("/registrar/stats", get(api_stats))
         .route("/registrar/root-authorization", get(api_root_authorization))
         .route("/resources", get(api_resources))
         .route("/resources/{did}", get(api_resource_detail))
@@ -641,6 +643,66 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "rootEndpoint": state.config.upstream.root_endpoint,
         "resourceRecordCount": records.len(),
         "protocolVersion": OAN_RESOURCE_PROTOCOL_VERSION
+    })))
+}
+
+async fn api_stats(State(state): State<AppState>) -> ApiResult<Value> {
+    let records = read_resource_records(&state)
+        .await
+        .map_err(ApiError::internal)?;
+    let today = Utc::now().date_naive();
+    let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+    let month_start = today.with_day(1).unwrap_or(today);
+    let mut counts = json!({
+        "agentServiceCount": 0,
+        "skillCount": 0,
+        "mcpServerCount": 0,
+        "toolApiCount": 0,
+        "todayRegistrationCount": 0,
+        "weekRegistrationCount": 0,
+        "monthRegistrationCount": 0,
+        "resourceRecordCount": records.len(),
+    });
+    for record in &records {
+        if let Some(resource_type) = record.get("resourceType").and_then(Value::as_str) {
+            let key = match resource_type {
+                "agent_service" => "agentServiceCount",
+                "skill" => "skillCount",
+                "mcp_server" => "mcpServerCount",
+                "tool_api" => "toolApiCount",
+                _ => "",
+            };
+            if !key.is_empty() {
+                counts[key] = json!(counts[key].as_i64().unwrap_or(0) + 1);
+            }
+        }
+        let Some(submitted_at) = record.get("submittedAt").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(submitted_at) = DateTime::parse_from_rfc3339(submitted_at) else {
+            continue;
+        };
+        let submitted_day = submitted_at.with_timezone(&Utc).date_naive();
+        if submitted_day == today {
+            counts["todayRegistrationCount"] = json!(counts["todayRegistrationCount"].as_i64().unwrap_or(0) + 1);
+        }
+        if submitted_day >= week_start {
+            counts["weekRegistrationCount"] = json!(counts["weekRegistrationCount"].as_i64().unwrap_or(0) + 1);
+        }
+        if submitted_day >= month_start {
+            counts["monthRegistrationCount"] = json!(counts["monthRegistrationCount"].as_i64().unwrap_or(0) + 1);
+        }
+    }
+    Ok(Json(json!({
+        "registrarDid": state.did,
+        "resourceRecordCount": counts["resourceRecordCount"],
+        "agentServiceCount": counts["agentServiceCount"],
+        "skillCount": counts["skillCount"],
+        "mcpServerCount": counts["mcpServerCount"],
+        "toolApiCount": counts["toolApiCount"],
+        "todayRegistrationCount": counts["todayRegistrationCount"],
+        "weekRegistrationCount": counts["weekRegistrationCount"],
+        "monthRegistrationCount": counts["monthRegistrationCount"],
     })))
 }
 
