@@ -28,6 +28,13 @@ max_in_flight = 32
 retry_after_seconds = 1
 upstream_timeout_ms = 15000
 
+[stats_report]
+enabled = false
+node_id = "registrar-official"
+endpoint = "http://localhost:8787/api/internal/node-stats/report"
+token = "change-me"
+interval_seconds = 60
+
 [paths]
 data_dir = "../../data/registrar"
 records_dir = "../../data/registrar/resource-records"

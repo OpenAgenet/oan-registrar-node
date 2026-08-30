@@ -3,7 +3,7 @@
 // Initial author: JINLIANG XU
 // Email: jlxufly@gmail.com
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{
     extract::{Path as AxumPath, State},
     http::{HeaderValue, Method, StatusCode},
@@ -11,8 +11,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Datelike, Utc};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, Datelike, Utc};
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
 use oan_credentials::sign_credential;
 use oan_crypto::{hash_json_with_suite, signing_key_from_bytes, SigningKey};
@@ -49,6 +49,8 @@ struct Config {
     cors: CorsConfig,
     #[serde(default)]
     security: SecurityConfig,
+    #[serde(default)]
+    stats_report: StatsReportConfig,
     upstream: UpstreamConfig,
     paths: PathConfig,
 }
@@ -83,6 +85,32 @@ struct UpstreamSecurityConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct StatsReportConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default = "default_stats_report_interval_seconds")]
+    interval_seconds: u64,
+}
+
+impl Default for StatsReportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: None,
+            endpoint: None,
+            token: None,
+            interval_seconds: default_stats_report_interval_seconds(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct PathConfig {
     data_dir: PathBuf,
     #[serde(default = "default_records_dir")]
@@ -103,6 +131,10 @@ fn default_keys_dir() -> PathBuf {
 
 fn default_root_did() -> String {
     "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
+}
+
+fn default_stats_report_interval_seconds() -> u64 {
+    60
 }
 
 #[derive(Clone)]
@@ -184,6 +216,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "services/registrar-node/config.example.toml".to_owned());
     let config = load_config(config_path)?;
+    validate_stats_report_config(&config.stats_report)?;
     let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
@@ -239,7 +272,14 @@ async fn main() -> Result<()> {
             post(api_registration_suggestions),
         )
         .layer(build_cors_layer(&config.cors)?)
-        .with_state(state);
+        .with_state(state.clone());
+
+    if state.config.stats_report.enabled {
+        let report_state = state.clone();
+        tokio::spawn(async move {
+            registrar_stats_report_loop(report_state).await;
+        });
+    }
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     println!("registrar-node listening on http://{addr}");
@@ -259,6 +299,39 @@ fn load_config(path: String) -> Result<Config> {
         *database_url = resolve_database_url(base, database_url);
     }
     Ok(config)
+}
+
+fn validate_stats_report_config(config: &StatsReportConfig) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    if config
+        .node_id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("stats_report.node_id is required when enabled"));
+    }
+    if config
+        .endpoint
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("stats_report.endpoint is required when enabled"));
+    }
+    if config
+        .token
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(anyhow!("stats_report.token is required when enabled"));
+    }
+    if config.interval_seconds == 0 {
+        return Err(anyhow!(
+            "stats_report.interval_seconds must be greater than 0"
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_relative(base: &Path, path: &Path) -> PathBuf {
@@ -647,10 +720,16 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
 }
 
 async fn api_stats(State(state): State<AppState>) -> ApiResult<Value> {
-    let records = read_resource_records(&state)
+    registrar_stats_body(&state)
         .await
-        .map_err(ApiError::internal)?;
-    let today = Utc::now().date_naive();
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn registrar_stats_body(state: &AppState) -> Result<Value> {
+    let records = read_resource_records(&state).await?;
+    let generated_at = Utc::now();
+    let today = generated_at.date_naive();
     let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
     let month_start = today.with_day(1).unwrap_or(today);
     let mut counts = json!({
@@ -684,17 +763,22 @@ async fn api_stats(State(state): State<AppState>) -> ApiResult<Value> {
         };
         let submitted_day = submitted_at.with_timezone(&Utc).date_naive();
         if submitted_day == today {
-            counts["todayRegistrationCount"] = json!(counts["todayRegistrationCount"].as_i64().unwrap_or(0) + 1);
+            counts["todayRegistrationCount"] =
+                json!(counts["todayRegistrationCount"].as_i64().unwrap_or(0) + 1);
         }
         if submitted_day >= week_start {
-            counts["weekRegistrationCount"] = json!(counts["weekRegistrationCount"].as_i64().unwrap_or(0) + 1);
+            counts["weekRegistrationCount"] =
+                json!(counts["weekRegistrationCount"].as_i64().unwrap_or(0) + 1);
         }
         if submitted_day >= month_start {
-            counts["monthRegistrationCount"] = json!(counts["monthRegistrationCount"].as_i64().unwrap_or(0) + 1);
+            counts["monthRegistrationCount"] =
+                json!(counts["monthRegistrationCount"].as_i64().unwrap_or(0) + 1);
         }
     }
-    Ok(Json(json!({
+    Ok(json!({
         "registrarDid": state.did,
+        "generatedAt": generated_at.to_rfc3339(),
+        "windowTimezone": "UTC",
         "resourceRecordCount": counts["resourceRecordCount"],
         "agentServiceCount": counts["agentServiceCount"],
         "skillCount": counts["skillCount"],
@@ -703,7 +787,68 @@ async fn api_stats(State(state): State<AppState>) -> ApiResult<Value> {
         "todayRegistrationCount": counts["todayRegistrationCount"],
         "weekRegistrationCount": counts["weekRegistrationCount"],
         "monthRegistrationCount": counts["monthRegistrationCount"],
-    })))
+    }))
+}
+
+async fn registrar_stats_report_loop(state: AppState) {
+    loop {
+        if let Err(err) = report_registrar_stats_once(&state).await {
+            eprintln!("registrar stats report failed: {err}");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            state.config.stats_report.interval_seconds,
+        ))
+        .await;
+    }
+}
+
+async fn report_registrar_stats_once(state: &AppState) -> Result<()> {
+    let config = &state.config.stats_report;
+    let stats = registrar_stats_body(state).await?;
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow!("stats_report.endpoint is required"))?;
+    let token = config
+        .token
+        .as_deref()
+        .ok_or_else(|| anyhow!("stats_report.token is required"))?;
+    let payload = json!({
+        "nodeId": config
+            .node_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("stats_report.node_id is required"))?,
+        "role": "registrar",
+        "status": "online",
+        "generatedAt": stats["generatedAt"],
+        "resourceTotals": {
+            "registeredResources": stats["resourceRecordCount"]
+        },
+        "resourcesByType": {
+            "agentService": stats["agentServiceCount"],
+            "skill": stats["skillCount"],
+            "mcpServer": stats["mcpServerCount"],
+            "toolApi": stats["toolApiCount"]
+        },
+        "registrationWindows": {
+            "today": stats["todayRegistrationCount"],
+            "thisWeek": stats["weekRegistrationCount"],
+            "thisMonth": stats["monthRegistrationCount"]
+        }
+    });
+    let response = state
+        .client
+        .post(endpoint)
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!("homepage returned {status}: {body}"));
+    }
+    Ok(())
 }
 
 async fn api_root_authorization(State(state): State<AppState>) -> ApiResult<Value> {
@@ -926,6 +1071,7 @@ mod tests {
                         root_did: "did:oan:AGRT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
                     },
                 },
+                stats_report: StatsReportConfig::default(),
                 upstream: UpstreamConfig {
                     root_endpoint: "http://127.0.0.1:8001".to_owned(),
                 },
@@ -1119,6 +1265,58 @@ mod tests {
             legacy_response.0["capabilityTags"],
             json!(["contract-review"])
         );
+    }
+
+    #[tokio::test]
+    async fn registrar_stats_report_payload_matches_stats_counts() {
+        async fn handler(Json(request): Json<Value>) -> Json<Value> {
+            assert_eq!(request["nodeId"], "registrar-test");
+            assert_eq!(request["role"], "registrar");
+            assert_eq!(request["status"], "online");
+            assert_eq!(request["resourceTotals"]["registeredResources"], 2);
+            assert_eq!(request["resourcesByType"]["skill"], 1);
+            assert_eq!(request["resourcesByType"]["mcpServer"], 1);
+            assert_eq!(request["registrationWindows"]["today"], 1);
+            Json(json!({ "status": "ok" }))
+        }
+        let app = Router::new().route("/api/internal/node-stats/report", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        state.config.stats_report = StatsReportConfig {
+            enabled: true,
+            node_id: Some("registrar-test".to_owned()),
+            endpoint: Some(format!("http://{addr}/api/internal/node-stats/report")),
+            token: Some("test-token".to_owned()),
+            interval_seconds: 60,
+        };
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": "did:oan:SKLG:today",
+                "resourceType": "skill",
+                "submittedAt": Utc::now().to_rfc3339()
+            }),
+        )
+        .await
+        .unwrap();
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": "did:oan:MCPS:old",
+                "resourceType": "mcp_server",
+                "submittedAt": (Utc::now() - Duration::days(40)).to_rfc3339()
+            }),
+        )
+        .await
+        .unwrap();
+
+        report_registrar_stats_once(&state).await.unwrap();
     }
 
     #[tokio::test]
