@@ -38,4 +38,5 @@ interval_seconds = 60
 [paths]
 data_dir = "../../data/registrar"
 records_dir = "../../data/registrar/resource-records"
+controller_authorization_nonce_file = "../../data/registrar/controller-authorization-nonces.json"
 database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_registrar"
