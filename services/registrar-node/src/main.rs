@@ -1295,6 +1295,11 @@ mod tests {
         let metadata = submission.did_document.oan_metadata.as_mut().unwrap();
         metadata.controller_did = Some(controller_did.to_owned());
         metadata.publisher_did = Some(controller_did.to_owned());
+        let did_document_hash =
+            hash_json_with_suite(CryptoSuite::Ed25519Sha256, &submission.did_document).unwrap();
+        submission.did_document_hash = format!("sha256:{did_document_hash}");
+        submission.subject_control_proof.challenge.did_document_hash =
+            submission.did_document_hash.clone();
         let challenge = ControllerAuthorizationChallenge {
             challenge_id: "controller-auth-test".to_owned(),
             resource_did: submission.resource_did.clone(),
@@ -1537,6 +1542,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.0["status"], "submitted");
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_tampered_external_controller_proof() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["legal".to_owned()]);
+        state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
+        let mut submission = sample_submission();
+        attach_external_controller_proof(&mut submission, "did:oan:AGUS:9ControllerProofTampered");
+        submission
+            .controller_authorization_proof
+            .as_mut()
+            .unwrap()
+            .proof
+            .proof_value = "tampered".to_owned();
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "controller_authorization_proof_invalid");
     }
 
     #[tokio::test]
