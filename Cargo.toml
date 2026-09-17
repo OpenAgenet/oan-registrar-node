@@ -8,7 +8,7 @@ resolver = "2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/OpenAgenet/oan-registrar-node"
-version = "0.1.0"
+version = "1.0.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -32,3 +32,4 @@ oan-protocol = { path = "../oan-protocol-common/crates/oan-protocol" }
 oan-semantic-recommender = { path = "../oan-protocol-common/crates/oan-semantic-recommender" }
 oan-service-security = { path = "../oan-protocol-common/crates/oan-service-security" }
 oan-storage = { path = "../oan-protocol-common/crates/oan-storage" }
+
