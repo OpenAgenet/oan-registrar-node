@@ -19,14 +19,16 @@ use oan_crypto::{hash_json_with_suite, signing_key_from_bytes, SigningKey};
 use oan_protocol::{
     HealthResponse, ResourceRegistrationSubmission, ResourceVerifyAndPublishRequest,
     OAN_RESOURCE_PROTOCOL_VERSION, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
-    PURPOSE_VERIFY_AND_PUBLISH,
+    PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION, PURPOSE_VERIFY_AND_PUBLISH,
 };
 use oan_semantic_recommender::{
     normalize_capability_tags, RegistrationSuggestionContext, RegistrationSuggestionInput,
     SemanticRecommender,
 };
 use oan_service_security::{
-    create_signed_request_envelope, request_id, request_nonce, SignedRequestEnvelopeInput,
+    create_signed_request_envelope, request_id, request_nonce,
+    verify_controller_authorization_proof, ControllerAuthorizationVerificationContext,
+    SignedRequestEnvelopeInput,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
@@ -386,6 +388,8 @@ async fn register_resource(
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
+    verify_controller_authorization_for_submission(&state, &submission)
+        .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
@@ -436,6 +440,54 @@ async fn register_resource(
         "registrationCredential": record["registrationCredential"],
         "rootResponse": record["rootResponse"]
     })))
+}
+
+fn verify_controller_authorization_for_submission(
+    state: &AppState,
+    submission: &ResourceRegistrationSubmission,
+) -> std::result::Result<Option<String>, String> {
+    let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(controller_did) = metadata.controller_did.as_deref() else {
+        return Ok(None);
+    };
+    if controller_did == submission.resource_did {
+        return Ok(None);
+    }
+    let Some(bundle) = submission.controller_authorization_proof.as_ref() else {
+        eprintln!(
+            "controller authorization proof missing for resource {} controlled by {}",
+            submission.resource_did, controller_did
+        );
+        return Err("controller_authorization_proof_required".to_owned());
+    };
+    let expected_publisher_did = metadata
+        .publisher_did
+        .as_deref()
+        .filter(|publisher_did| *publisher_did == controller_did);
+    verify_controller_authorization_proof(
+        bundle,
+        &ControllerAuthorizationVerificationContext {
+            expected_resource_did: &submission.resource_did,
+            expected_controller_did: controller_did,
+            expected_publisher_did,
+            expected_did_document_hash: &submission.did_document_hash,
+            expected_metadata_hash: &submission.metadata_hash,
+            expected_registrar_did: &state.did,
+            expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+            now: Utc::now(),
+        },
+    )
+    .map(Some)
+    .map_err(|err| {
+        let message = err.to_string();
+        eprintln!(
+            "controller authorization proof rejected for resource {} controlled by {}: {}",
+            submission.resource_did, controller_did, message
+        );
+        message
+    })
 }
 
 fn validate_resource_authorized_domains_for_registrar(
@@ -1053,7 +1105,10 @@ mod tests {
         VerificationMethod,
     };
     use oan_crypto::{generate_ed25519_keypair, public_key_multibase, VerifyingKey};
-    use oan_protocol::{DidControlChallenge, SubjectControlProofBundle};
+    use oan_protocol::{
+        ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
+        SubjectControlProofBundle,
+    };
     use tempfile::tempdir;
 
     fn app_state(dir: &std::path::Path) -> AppState {
@@ -1114,6 +1169,7 @@ mod tests {
             }],
             authentication: vec![format!("{did}#key-1")],
             assertion_method: vec![format!("{did}#key-1")],
+            capability_invocation: vec![format!("{did}#key-1")],
             service: vec![ServiceEndpoint {
                 id: format!("{did}#download"),
                 service_type: "SkillPackageDownload".to_owned(),
@@ -1204,7 +1260,71 @@ mod tests {
                 verified_verification_method: Some(format!("{did}#key-1")),
                 proof_hash: Some("proof-hash".to_owned()),
             },
+            controller_authorization_proof: None,
         }
+    }
+
+    fn attach_external_controller_proof(
+        submission: &mut ResourceRegistrationSubmission,
+        controller_did: &str,
+    ) {
+        let controller_key = generate_ed25519_keypair();
+        let controller_method = format!("{controller_did}#key-1");
+        let verifying_key = VerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: controller_key.verifying_key(),
+        };
+        let controller_document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: controller_did.to_owned(),
+            verification_method: vec![VerificationMethod {
+                id: controller_method.clone(),
+                method_type: "Ed25519VerificationKey2020".to_owned(),
+                controller: controller_did.to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                public_key_format: Some("multibase".to_owned()),
+                public_key_multibase: Some(public_key_multibase(&verifying_key)),
+                public_key_jwk: None,
+            }],
+            authentication: vec![controller_method.clone()],
+            assertion_method: vec![controller_method.clone()],
+            capability_invocation: vec![controller_method.clone()],
+            service: vec![],
+            oan_metadata: None,
+        };
+        let metadata = submission.did_document.oan_metadata.as_mut().unwrap();
+        metadata.controller_did = Some(controller_did.to_owned());
+        metadata.publisher_did = Some(controller_did.to_owned());
+        let challenge = ControllerAuthorizationChallenge {
+            challenge_id: "controller-auth-test".to_owned(),
+            resource_did: submission.resource_did.clone(),
+            controller_did: controller_did.to_owned(),
+            publisher_did: Some(controller_did.to_owned()),
+            did_document_hash: submission.did_document_hash.clone(),
+            metadata_hash: submission.metadata_hash.clone(),
+            registrar_did: "did:oan:AGRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+            purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION.to_owned(),
+            verification_method: controller_method.clone(),
+            nonce: "controller-auth-nonce".to_owned(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::seconds(300),
+        };
+        let signing_key = SigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: controller_key,
+        };
+        let proof = oan_crypto::build_data_integrity_proof(
+            &challenge,
+            controller_did.to_owned(),
+            controller_method,
+            &signing_key,
+        )
+        .unwrap();
+        submission.controller_authorization_proof = Some(ControllerAuthorizationProofBundle {
+            challenge,
+            controller_did_document: controller_document,
+            proof,
+        });
     }
 
     fn write_registrar_document(state: &AppState, domains: Vec<String>) {
@@ -1365,6 +1485,58 @@ mod tests {
         assert_eq!(stored["resourceDid"], submission.resource_did);
         assert_eq!(stored["authorizedDomains"], json!(["legal"]));
         assert!(stored["registrationCredential"]["proof"]["proofValue"].is_string());
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_external_controller_without_proof() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["legal".to_owned()]);
+        state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
+        let mut submission = sample_submission();
+        submission
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .controller_did = Some("did:oan:AGUS:ControllerMissingProof".to_owned());
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "controller_authorization_proof_required");
+    }
+
+    #[tokio::test]
+    async fn register_resource_accepts_external_controller_proof_and_forwards_it() {
+        async fn handler(Json(request): Json<ResourceVerifyAndPublishRequest>) -> Json<Value> {
+            assert!(request.submission.controller_authorization_proof.is_some());
+            Json(json!({
+                "status": "resource-verified-and-queued",
+                "resourceDid": request.submission.resource_did
+            }))
+        }
+        let app = Router::new().route(PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        write_registrar_document(&state, vec!["legal".to_owned()]);
+        state.config.upstream.root_endpoint = format!("http://{addr}");
+        let mut submission = sample_submission();
+        attach_external_controller_proof(&mut submission, "did:oan:AGUS:9ControllerProofAccepted");
+
+        let response = register_resource(State(state), Json(submission))
+            .await
+            .unwrap();
+
+        assert_eq!(response.0["status"], "submitted");
     }
 
     #[tokio::test]
