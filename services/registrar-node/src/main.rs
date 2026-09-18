@@ -6,29 +6,35 @@
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{Path as AxumPath, State},
-    http::{HeaderValue, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
 use oan_credentials::sign_credential;
-use oan_crypto::{hash_json_with_suite, signing_key_from_bytes, SigningKey};
+use oan_crypto::{
+    hash_json_with_suite, signing_key_from_bytes, verify_payload_with_proof,
+    verifying_key_from_method, SigningKey,
+};
 use oan_protocol::{
-    HealthResponse, ResourceRegistrationSubmission, ResourceVerifyAndPublishRequest,
-    OAN_RESOURCE_PROTOCOL_VERSION, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
-    PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION, PURPOSE_VERIFY_AND_PUBLISH,
+    HealthResponse, RegistrationCredentialQueryRequest, ResourceRegistrationSubmission,
+    ResourceVerifyAndPublishRequest, OAN_RESOURCE_PROTOCOL_VERSION,
+    PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PROTOCOL_REGISTRATION_CREDENTIAL_QUERY_V1,
+    PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION, PURPOSE_REGISTRATION_CREDENTIAL_QUERY,
+    PURPOSE_VERIFY_AND_PUBLISH,
 };
 use oan_semantic_recommender::{
     normalize_capability_tags, RegistrationSuggestionContext, RegistrationSuggestionInput,
     SemanticRecommender,
 };
 use oan_service_security::{
-    create_signed_request_envelope, request_id, request_nonce, verify_and_store_nonce,
-    verify_controller_authorization_proof, ControllerAuthorizationVerificationContext,
-    SignedRequestEnvelopeInput,
+    create_signed_request_envelope, find_relationship_method, request_id, request_nonce,
+    verify_and_store_nonce, verify_controller_authorization_proof,
+    ControllerAuthorizationVerificationContext, SignedRequestEnvelopeInput,
+    VerificationRelationship,
 };
 use oan_storage::{
     did_to_file_name, DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
@@ -121,6 +127,8 @@ struct PathConfig {
     keys_dir: PathBuf,
     #[serde(default = "default_controller_authorization_nonce_file")]
     controller_authorization_nonce_file: PathBuf,
+    #[serde(default = "default_registration_credential_query_nonce_file")]
+    registration_credential_query_nonce_file: PathBuf,
     #[serde(default)]
     database_url: Option<String>,
 }
@@ -135,6 +143,10 @@ fn default_keys_dir() -> PathBuf {
 
 fn default_controller_authorization_nonce_file() -> PathBuf {
     PathBuf::from("../../data/registrar/controller-authorization-nonces.json")
+}
+
+fn default_registration_credential_query_nonce_file() -> PathBuf {
+    PathBuf::from("../../data/registrar/registration-credential-query-nonces.json")
 }
 
 fn default_root_did() -> String {
@@ -196,6 +208,27 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
     fn internal(error: impl Into<anyhow::Error>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -217,6 +250,9 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
+
+const REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
+const REGISTRATION_CREDENTIAL_QUERY_NONCE_TTL_SECONDS: i64 = 600;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -268,6 +304,10 @@ async fn main() -> Result<()> {
         .route("/registrar/root-authorization", get(api_root_authorization))
         .route("/resources", get(api_resources))
         .route("/resources/{did}", get(api_resource_detail))
+        .route(
+            "/resources/{did}/registration-credential",
+            post(api_registration_credential),
+        )
         .route("/capability-tree", get(api_capability_tree))
         .route("/capability-tags/suggest", post(api_suggest_tags))
         .route("/capability-tags/normalize", post(api_normalize_tags))
@@ -305,6 +345,8 @@ fn load_config(path: String) -> Result<Config> {
     config.paths.keys_dir = resolve_relative(base, &config.paths.keys_dir);
     config.paths.controller_authorization_nonce_file =
         resolve_relative(base, &config.paths.controller_authorization_nonce_file);
+    config.paths.registration_credential_query_nonce_file =
+        resolve_relative(base, &config.paths.registration_credential_query_nonce_file);
     if let Some(database_url) = config.paths.database_url.as_mut() {
         *database_url = resolve_database_url(base, database_url);
     }
@@ -396,8 +438,9 @@ async fn register_resource(
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
-    verify_controller_authorization_for_submission(&state, &submission)
-        .map_err(ApiError::bad_request)?;
+    let verified_controller_method =
+        verify_controller_authorization_for_submission(&state, &submission)
+            .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
@@ -428,7 +471,7 @@ async fn register_resource(
             .map_err(ApiError::internal)?;
     let registration_credential =
         issue_resource_registration_credential(&state, &submission, &did_document_hash)?;
-    let record = json!({
+    let mut record = json!({
         "resourceDid": submission.resource_did,
         "resourceType": submission.resource_type,
         "packageVersion": submission.package_version,
@@ -440,6 +483,48 @@ async fn register_resource(
         "rootResponse": body,
         "submittedAt": chrono::Utc::now()
     });
+    if let Some(verification_method) = verified_controller_method {
+        if let Some(controller_did) = submission
+            .did_document
+            .oan_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.controller_did.as_deref())
+        {
+            let controller_method_hash = submission
+                .controller_authorization_proof
+                .as_ref()
+                .and_then(|bundle| {
+                    controller_method_hash(
+                        &state,
+                        &bundle.controller_did_document,
+                        &verification_method,
+                    )
+                    .ok()
+                })
+                .ok_or_else(|| ApiError::bad_request("controller_authorization_method_missing"))?;
+            record["registrationCredentialAccess"] = json!({
+                "enabled": true,
+                "controllerDid": controller_did,
+                "verifiedVerificationMethod": verification_method,
+                "verifiedControllerMethodHash": controller_method_hash,
+                "verifiedAuthorityBindingHash": hash_json_with_suite(
+                    state.signing_key.crypto_suite(),
+                    &json!({
+                        "resourceDid": submission.resource_did,
+                        "controllerDid": controller_did,
+                        "verificationMethod": verification_method,
+                        "didDocumentHash": submission.did_document_hash,
+                        "metadataHash": submission.metadata_hash,
+                        "registrarDid": state.did,
+                        "purpose": PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION
+                    })
+                )
+                .map_err(ApiError::internal)?,
+                "verifiedAt": Utc::now(),
+                "policyVersion": "registration-credential-access-v1"
+            });
+        }
+    }
     write_resource_record(&state, &record).await?;
     Ok(Json(json!({
         "status": "submitted",
@@ -968,7 +1053,11 @@ async fn api_resources(State(state): State<AppState>) -> ApiResult<Value> {
     let records = read_resource_records(&state)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "items": records, "count": records.len() })))
+    let items: Vec<Value> = records
+        .iter()
+        .map(public_resource_record_projection)
+        .collect();
+    Ok(Json(json!({ "items": items, "count": items.len() })))
 }
 
 async fn api_resource_detail(
@@ -978,7 +1067,202 @@ async fn api_resource_detail(
     let record = read_resource_record(&state, &did)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "resourceDid": did, "record": record })))
+    Ok(Json(json!({
+        "resourceDid": did,
+        "record": record.as_ref().map(public_resource_record_projection)
+    })))
+}
+
+fn public_resource_record_projection(record: &Value) -> Value {
+    let mut projection = serde_json::Map::new();
+    for field in [
+        "resourceDid",
+        "resourceType",
+        "packageVersion",
+        "didDocumentHash",
+        "metadataHash",
+        "packageHash",
+        "authorizedDomains",
+        "submittedAt",
+    ] {
+        if let Some(value) = record.get(field) {
+            projection.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(status) = record
+        .get("rootResponse")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+    {
+        projection.insert("rootStatus".to_owned(), json!(status));
+    }
+    Value::Object(projection)
+}
+
+async fn api_registration_credential(
+    State(state): State<AppState>,
+    AxumPath(did): AxumPath<String>,
+    Json(request): Json<RegistrationCredentialQueryRequest>,
+) -> std::result::Result<Response, ApiError> {
+    let record = read_resource_record(&state, &did)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("resource_not_found"))?;
+    let registration_credential = record
+        .get("registrationCredential")
+        .cloned()
+        .ok_or_else(|| ApiError::forbidden("registration_credential_access_denied"))?;
+    verify_registration_credential_query(&state, &did, &record, &request)?;
+    let body = json!({
+        "resourceDid": did,
+        "controllerDid": request.challenge.controller_did,
+        "registrationCredential": registration_credential
+    });
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(body),
+    )
+        .into_response())
+}
+
+fn verify_registration_credential_query(
+    state: &AppState,
+    resource_did: &str,
+    record: &Value,
+    request: &RegistrationCredentialQueryRequest,
+) -> std::result::Result<(), ApiError> {
+    let challenge = &request.challenge;
+    if challenge.method != "POST"
+        || challenge.path != registration_credential_query_path(resource_did)
+        || challenge.resource_did != resource_did
+        || challenge.purpose != PURPOSE_REGISTRATION_CREDENTIAL_QUERY
+        || challenge.aud != state.did
+        || challenge.protocol_version != PROTOCOL_REGISTRATION_CREDENTIAL_QUERY_V1
+        || challenge.request_nonce.trim().is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "invalid_registration_credential_query",
+        ));
+    }
+    if challenge.request_timestamp
+        > Utc::now() + Duration::seconds(REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS)
+        || Utc::now()
+            > challenge.request_timestamp
+                + Duration::seconds(REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS)
+    {
+        return Err(ApiError::bad_request(
+            "registration_credential_query_expired",
+        ));
+    }
+    let access = record
+        .get("registrationCredentialAccess")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::forbidden("registration_credential_access_unavailable_for_legacy_resource")
+        })?;
+    if access.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return Err(ApiError::forbidden("registration_credential_access_denied"));
+    }
+    if access
+        .get("controllerDid")
+        .and_then(Value::as_str)
+        .map(|value| value != challenge.controller_did)
+        .unwrap_or(true)
+    {
+        return Err(ApiError::forbidden("registration_credential_access_denied"));
+    }
+    if access
+        .get("verifiedVerificationMethod")
+        .and_then(Value::as_str)
+        .map(|value| value != challenge.verification_method)
+        .unwrap_or(true)
+    {
+        return Err(ApiError::forbidden("registration_credential_access_denied"));
+    }
+    if request.controller_did_document.id != challenge.controller_did {
+        return Err(ApiError::unauthorized("invalid_controller_signature"));
+    }
+    let method = find_relationship_method(
+        &request.controller_did_document,
+        VerificationRelationship::CapabilityInvocation,
+        Some(&challenge.verification_method),
+    )
+    .or_else(|_| {
+        find_relationship_method(
+            &request.controller_did_document,
+            VerificationRelationship::Authentication,
+            Some(&challenge.verification_method),
+        )
+    })
+    .or_else(|_| {
+        find_relationship_method(
+            &request.controller_did_document,
+            VerificationRelationship::AssertionMethod,
+            Some(&challenge.verification_method),
+        )
+    })
+    .map_err(|_| ApiError::unauthorized("invalid_controller_signature"))?;
+    let verifying_key = verifying_key_from_method(method)
+        .map_err(|_| ApiError::unauthorized("invalid_controller_signature"))?;
+    let expected_method_hash = access
+        .get("verifiedControllerMethodHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::forbidden("registration_credential_access_denied"))?;
+    let actual_method_hash = hash_json_with_suite(state.signing_key.crypto_suite(), method)
+        .map_err(|_| ApiError::unauthorized("invalid_controller_signature"))?;
+    if actual_method_hash != expected_method_hash {
+        return Err(ApiError::forbidden("registration_credential_access_denied"));
+    }
+    verify_payload_with_proof(challenge, &request.proof, &verifying_key)
+        .map_err(|_| ApiError::unauthorized("invalid_controller_signature"))?;
+    verify_and_store_nonce(
+        &state.config.paths.registration_credential_query_nonce_file,
+        &challenge.request_nonce,
+        challenge.request_timestamp,
+        Utc::now(),
+        REGISTRATION_CREDENTIAL_QUERY_NONCE_TTL_SECONDS,
+    )
+    .map_err(|err| {
+        if err.to_string().contains("nonce_replayed") {
+            ApiError::forbidden("registration_credential_query_replay")
+        } else {
+            ApiError::bad_request("invalid_registration_credential_query")
+        }
+    })?;
+    Ok(())
+}
+
+fn registration_credential_query_path(resource_did: &str) -> String {
+    format!(
+        "/resources/{}/registration-credential",
+        percent_encode_path_segment(resource_did)
+    )
+}
+
+fn controller_method_hash(
+    state: &AppState,
+    controller_document: &DidDocument,
+    verification_method: &str,
+) -> std::result::Result<String, ApiError> {
+    let method = controller_document
+        .verification_method
+        .iter()
+        .find(|method| method.id == verification_method)
+        .ok_or_else(|| ApiError::bad_request("controller_authorization_method_missing"))?;
+    hash_json_with_suite(state.signing_key.crypto_suite(), method).map_err(ApiError::internal)
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char)
+            }
+            _ => output.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    output
 }
 
 async fn api_capability_tree() -> ApiResult<Value> {
@@ -1132,7 +1416,7 @@ mod tests {
     use oan_crypto::{generate_ed25519_keypair, public_key_multibase, VerifyingKey};
     use oan_protocol::{
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
-        SubjectControlProofBundle,
+        RegistrationCredentialQueryChallenge, SubjectControlProofBundle,
     };
     use tempfile::tempdir;
 
@@ -1161,6 +1445,8 @@ mod tests {
                     keys_dir: dir.join("keys"),
                     controller_authorization_nonce_file: dir
                         .join("controller-authorization-nonces.json"),
+                    registration_credential_query_nonce_file: dir
+                        .join("registration-credential-query-nonces.json"),
                     database_url: None,
                 },
             },
@@ -1359,6 +1645,87 @@ mod tests {
         });
     }
 
+    fn controller_query_request(
+        state: &AppState,
+        resource_did: &str,
+        controller_did: &str,
+        nonce: &str,
+    ) -> RegistrationCredentialQueryRequest {
+        let controller_key = generate_ed25519_keypair();
+        let controller_method = format!("{controller_did}#key-1");
+        let verifying_key = VerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: controller_key.verifying_key(),
+        };
+        let controller_document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: controller_did.to_owned(),
+            verification_method: vec![VerificationMethod {
+                id: controller_method.clone(),
+                method_type: "Ed25519VerificationKey2020".to_owned(),
+                controller: controller_did.to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                public_key_format: Some("multibase".to_owned()),
+                public_key_multibase: Some(public_key_multibase(&verifying_key)),
+                public_key_jwk: None,
+            }],
+            authentication: vec![controller_method.clone()],
+            assertion_method: vec![controller_method.clone()],
+            capability_invocation: vec![controller_method.clone()],
+            service: vec![],
+            oan_metadata: None,
+        };
+        let challenge = RegistrationCredentialQueryChallenge {
+            method: "POST".to_owned(),
+            path: registration_credential_query_path(resource_did),
+            resource_did: resource_did.to_owned(),
+            controller_did: controller_did.to_owned(),
+            verification_method: controller_method.clone(),
+            purpose: PURPOSE_REGISTRATION_CREDENTIAL_QUERY.to_owned(),
+            request_timestamp: Utc::now(),
+            request_nonce: nonce.to_owned(),
+            aud: state.did.clone(),
+            protocol_version: PROTOCOL_REGISTRATION_CREDENTIAL_QUERY_V1.to_owned(),
+            body_hash: None,
+        };
+        let signing_key = SigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: controller_key,
+        };
+        let proof = oan_crypto::build_data_integrity_proof(
+            &challenge,
+            controller_did.to_owned(),
+            controller_method,
+            &signing_key,
+        )
+        .unwrap();
+        RegistrationCredentialQueryRequest {
+            challenge,
+            controller_did_document: controller_document,
+            proof,
+        }
+    }
+
+    fn credential_access_marker(
+        state: &AppState,
+        request: &RegistrationCredentialQueryRequest,
+    ) -> Value {
+        let method = request
+            .controller_did_document
+            .verification_method
+            .iter()
+            .find(|method| method.id == request.challenge.verification_method)
+            .unwrap();
+        json!({
+            "enabled": true,
+            "controllerDid": request.challenge.controller_did,
+            "verifiedVerificationMethod": request.challenge.verification_method,
+            "verifiedControllerMethodHash": hash_json_with_suite(state.signing_key.crypto_suite(), method).unwrap(),
+            "verifiedAt": Utc::now().to_rfc3339(),
+            "policyVersion": "registration-credential-access-v1"
+        })
+    }
+
     fn write_registrar_document(state: &AppState, domains: Vec<String>) {
         let mut document = sample_document(&state.did);
         document.oan_metadata.as_mut().unwrap().authorized_domains = domains;
@@ -1471,6 +1838,290 @@ mod tests {
         report_registrar_stats_once(&state).await.unwrap();
     }
 
+    #[test]
+    fn public_resource_record_projection_redacts_sensitive_fields() {
+        let record = json!({
+            "resourceDid": "did:oan:SKLG:redaction",
+            "resourceType": "skill",
+            "packageVersion": "1",
+            "didDocumentHash": "sha256:did",
+            "metadataHash": "sha256:metadata",
+            "packageHash": "sha256:package",
+            "authorizedDomains": ["legal"],
+            "submittedAt": "2026-09-18T00:00:00Z",
+            "registrationCredential": {
+                "proof": {
+                    "proofValue": "secret-proof"
+                }
+            },
+            "rootResponse": {
+                "status": "resource-verified-and-queued",
+                "package": {
+                    "internal": true
+                }
+            },
+            "registrationCredentialAccess": {
+                "enabled": true,
+                "controllerDid": "did:oan:AGUS:controller",
+                "verifiedAuthorityBindingHash": "sha256:binding"
+            },
+            "databasePath": "/internal/registrar.db"
+        });
+
+        let projection = public_resource_record_projection(&record);
+
+        assert_eq!(projection["resourceDid"], "did:oan:SKLG:redaction");
+        assert_eq!(projection["resourceType"], "skill");
+        assert_eq!(projection["rootStatus"], "resource-verified-and-queued");
+        assert!(projection.get("registrationCredential").is_none());
+        assert!(projection.get("rootResponse").is_none());
+        assert!(projection.get("registrationCredentialAccess").is_none());
+        assert!(projection.get("verifiedAuthorityBindingHash").is_none());
+        assert!(projection.get("databasePath").is_none());
+    }
+
+    #[tokio::test]
+    async fn resource_get_handlers_return_redacted_public_projection() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:redacted-handler";
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "packageVersion": "1",
+                "didDocumentHash": "sha256:did",
+                "metadataHash": "sha256:metadata",
+                "packageHash": "sha256:package",
+                "authorizedDomains": ["legal"],
+                "submittedAt": "2026-09-18T00:00:00Z",
+                "registrationCredential": {
+                    "type": ["VerifiableCredential", "OANResourceRegistrationCredential"],
+                    "proof": {
+                        "proofValue": "secret-proof"
+                    }
+                },
+                "rootResponse": {
+                    "status": "resource-verified-and-queued",
+                    "privateRootDetail": "internal"
+                },
+                "registrationCredentialAccess": {
+                    "enabled": true,
+                    "controllerDid": "did:oan:AGUS:controller",
+                    "verifiedAuthorityBindingHash": "sha256:binding"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let detail = api_resource_detail(State(state.clone()), AxumPath(resource_did.to_owned()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(detail["resourceDid"], resource_did);
+        assert_eq!(detail["record"]["resourceDid"], resource_did);
+        assert_eq!(
+            detail["record"]["rootStatus"],
+            "resource-verified-and-queued"
+        );
+        assert!(detail["record"].get("registrationCredential").is_none());
+        assert!(detail["record"].get("rootResponse").is_none());
+        assert!(detail["record"]
+            .get("registrationCredentialAccess")
+            .is_none());
+
+        let list = api_resources(State(state.clone())).await.unwrap().0;
+        assert_eq!(list["count"], 1);
+        assert_eq!(list["items"][0]["resourceDid"], resource_did);
+        assert!(list["items"][0].get("registrationCredential").is_none());
+        assert!(list["items"][0].get("rootResponse").is_none());
+        assert!(list["items"][0]
+            .get("registrationCredentialAccess")
+            .is_none());
+
+        let stored = read_resource_record(&state, resource_did)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored["registrationCredential"]["proof"]["proofValue"],
+            "secret-proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_credential_query_returns_vc_for_authorized_new_record() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:credential-query";
+        let controller_did = "did:oan:AGUS:CredentialQueryController";
+        let request =
+            controller_query_request(&state, resource_did, controller_did, "query-nonce-1");
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "registrationCredential": {
+                    "id": "urn:credential:registration",
+                    "proof": {
+                        "proofValue": "secret-proof"
+                    }
+                },
+                "registrationCredentialAccess": credential_access_marker(&state, &request)
+            }),
+        )
+        .await
+        .unwrap();
+
+        let response = api_registration_credential(
+            State(state),
+            AxumPath(resource_did.to_owned()),
+            Json(request),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_credential_query_rejects_legacy_record_without_access_marker() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:legacy-query";
+        let controller_did = "did:oan:AGUS:LegacyController";
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "registrationCredential": {
+                    "proof": {
+                        "proofValue": "legacy-secret-proof"
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let request =
+            controller_query_request(&state, resource_did, controller_did, "query-nonce-legacy");
+
+        let err = api_registration_credential(
+            State(state),
+            AxumPath(resource_did.to_owned()),
+            Json(request),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.message,
+            "registration_credential_access_unavailable_for_legacy_resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_credential_query_rejects_controller_mismatch_and_replay() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:query-replay";
+        let controller_did = "did:oan:AGUS:ExpectedController";
+        let request =
+            controller_query_request(&state, resource_did, controller_did, "query-nonce-replay");
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "registrationCredential": {
+                    "proof": {
+                        "proofValue": "secret-proof"
+                    }
+                },
+                "registrationCredentialAccess": credential_access_marker(&state, &request)
+            }),
+        )
+        .await
+        .unwrap();
+
+        let wrong_controller_request = controller_query_request(
+            &state,
+            resource_did,
+            "did:oan:AGUS:WrongController",
+            "query-nonce-wrong-controller",
+        );
+        let err = api_registration_credential(
+            State(state.clone()),
+            AxumPath(resource_did.to_owned()),
+            Json(wrong_controller_request),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        api_registration_credential(
+            State(state.clone()),
+            AxumPath(resource_did.to_owned()),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap();
+        let err = api_registration_credential(
+            State(state),
+            AxumPath(resource_did.to_owned()),
+            Json(request),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.message, "registration_credential_query_replay");
+    }
+
+    #[tokio::test]
+    async fn registration_credential_query_rejects_tampered_challenge_binding() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:query-tamper";
+        let controller_did = "did:oan:AGUS:TamperController";
+        let mut request =
+            controller_query_request(&state, resource_did, controller_did, "query-nonce-tamper");
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "registrationCredential": {
+                    "proof": {
+                        "proofValue": "secret-proof"
+                    }
+                },
+                "registrationCredentialAccess": credential_access_marker(&state, &request)
+            }),
+        )
+        .await
+        .unwrap();
+        request.challenge.path = "/resources/wrong/registration-credential".to_owned();
+
+        let err = api_registration_credential(
+            State(state),
+            AxumPath(resource_did.to_owned()),
+            Json(request),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "invalid_registration_credential_query");
+    }
+
     #[tokio::test]
     async fn register_resource_posts_to_root_and_records_resource() {
         async fn handler(Json(request): Json<ResourceVerifyAndPublishRequest>) -> Json<Value> {
@@ -1517,6 +2168,7 @@ mod tests {
         assert_eq!(stored["resourceDid"], submission.resource_did);
         assert_eq!(stored["authorizedDomains"], json!(["legal"]));
         assert!(stored["registrationCredential"]["proof"]["proofValue"].is_string());
+        assert!(stored.get("registrationCredentialAccess").is_none());
     }
 
     #[tokio::test]
@@ -1564,11 +2216,34 @@ mod tests {
         let mut submission = sample_submission();
         attach_external_controller_proof(&mut submission, "did:oan:AGUS:9ControllerProofAccepted");
 
-        let response = register_resource(State(state), Json(submission))
+        let response = register_resource(State(state.clone()), Json(submission.clone()))
             .await
             .unwrap();
 
         assert_eq!(response.0["status"], "submitted");
+        let stored = read_resource_record(&state, &submission.resource_did)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored["registrationCredentialAccess"]["enabled"],
+            json!(true)
+        );
+        assert_eq!(
+            stored["registrationCredentialAccess"]["controllerDid"],
+            "did:oan:AGUS:9ControllerProofAccepted"
+        );
+        assert!(stored["registrationCredentialAccess"]["verifiedVerificationMethod"].is_string());
+        assert!(stored["registrationCredentialAccess"]["verifiedControllerMethodHash"].is_string());
+        assert!(stored["registrationCredentialAccess"]["verifiedAuthorityBindingHash"].is_string());
+        let public_detail =
+            api_resource_detail(State(state), AxumPath(submission.resource_did.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert!(public_detail["record"]
+            .get("registrationCredentialAccess")
+            .is_none());
     }
 
     #[tokio::test]
