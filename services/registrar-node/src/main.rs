@@ -1157,9 +1157,7 @@ fn verify_registration_credential_query(
     let access = record
         .get("registrationCredentialAccess")
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ApiError::forbidden("registration_credential_access_unavailable_for_legacy_resource")
-        })?;
+        .ok_or_else(|| ApiError::forbidden("registration_credential_access_denied"))?;
     if access.get("enabled").and_then(Value::as_bool) != Some(true) {
         return Err(ApiError::forbidden("registration_credential_access_denied"));
     }
@@ -1991,11 +1989,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_credential_query_rejects_legacy_record_without_access_marker() {
+    async fn registration_credential_query_rejects_record_without_access_marker() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:legacy-query";
-        let controller_did = "did:oan:AGUS:LegacyController";
+        let resource_did = "did:oan:SKLG:no-access-marker-query";
+        let controller_did = "did:oan:AGUS:NoAccessMarkerController";
         write_resource_record(
             &state,
             &json!({
@@ -2003,15 +2001,19 @@ mod tests {
                 "resourceType": "skill",
                 "registrationCredential": {
                     "proof": {
-                        "proofValue": "legacy-secret-proof"
+                        "proofValue": "secret-proof"
                     }
                 }
             }),
         )
         .await
         .unwrap();
-        let request =
-            controller_query_request(&state, resource_did, controller_did, "query-nonce-legacy");
+        let request = controller_query_request(
+            &state,
+            resource_did,
+            controller_did,
+            "query-nonce-no-marker",
+        );
 
         let err = api_registration_credential(
             State(state),
@@ -2022,10 +2024,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.status, StatusCode::FORBIDDEN);
-        assert_eq!(
-            err.message,
-            "registration_credential_access_unavailable_for_legacy_resource"
-        );
+        assert_eq!(err.message, "registration_credential_access_denied");
     }
 
     #[tokio::test]
