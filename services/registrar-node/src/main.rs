@@ -179,6 +179,8 @@ struct ResourceListQuery {
 
 const REGISTRAR_DEFAULT_PAGE_SIZE: u32 = 100;
 const REGISTRAR_MAX_PAGE_SIZE: u32 = 500;
+const REGISTRAR_MAX_RECORD_BYTES: usize = 1024 * 1024;
+const REGISTRAR_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 struct DevKeyFile {
@@ -1176,6 +1178,7 @@ async fn api_resources(
     let mut items = Vec::new();
     let mut has_more = false;
     let mut next_did = None;
+    let mut page_bytes = 0_usize;
     if let Some(sqlite) = &state.sqlite {
         let rows = sqlx::query(
             "SELECT record_key, value_json FROM json_records
@@ -1195,9 +1198,11 @@ async fn api_resources(
             }
             let did = row.get::<String, _>(0);
             next_did = Some(did);
-            let record: Value =
-                serde_json::from_str(&row.get::<String, _>(1)).map_err(ApiError::internal)?;
-            items.push(public_resource_record_projection(&record));
+            let value_json = row.get::<String, _>(1);
+            items.push(public_resource_record_projection_from_json(
+                &value_json,
+                &mut page_bytes,
+            )?);
         }
     } else if let Some(postgres) = &state.postgres {
         let rows = sqlx::query(
@@ -1218,9 +1223,11 @@ async fn api_resources(
             }
             let did = row.get::<String, _>(0);
             next_did = Some(did);
-            let record: Value =
-                serde_json::from_str(&row.get::<String, _>(1)).map_err(ApiError::internal)?;
-            items.push(public_resource_record_projection(&record));
+            let value_json = row.get::<String, _>(1);
+            items.push(public_resource_record_projection_from_json(
+                &value_json,
+                &mut page_bytes,
+            )?);
         }
     } else {
         let records = read_resource_records(&state)
@@ -1238,7 +1245,11 @@ async fn api_resources(
         records.truncate(limit as usize);
         for (did, record) in records {
             next_did = Some(did);
-            items.push(public_resource_record_projection(record));
+            let value_json = serde_json::to_string(record).map_err(ApiError::internal)?;
+            items.push(public_resource_record_projection_from_json(
+                &value_json,
+                &mut page_bytes,
+            )?);
         }
     }
     if !has_more {
@@ -1251,6 +1262,22 @@ async fn api_resources(
         "nextDid": next_did,
         "hasMore": has_more
     })))
+}
+
+fn public_resource_record_projection_from_json(
+    value_json: &str,
+    page_bytes: &mut usize,
+) -> std::result::Result<Value, ApiError> {
+    let record_bytes = value_json.len();
+    if record_bytes > REGISTRAR_MAX_RECORD_BYTES {
+        return Err(ApiError::bad_request("resource_record_too_large"));
+    }
+    *page_bytes = page_bytes.saturating_add(record_bytes);
+    if *page_bytes > REGISTRAR_MAX_PAGE_BYTES {
+        return Err(ApiError::bad_request("resource_page_too_large"));
+    }
+    let record: Value = serde_json::from_str(value_json).map_err(ApiError::internal)?;
+    Ok(public_resource_record_projection(&record))
 }
 
 async fn api_resource_detail(
@@ -2212,6 +2239,37 @@ mod tests {
         );
         assert_eq!(second["hasMore"], false);
         assert!(second["nextDid"].is_null());
+    }
+
+    #[tokio::test]
+    async fn resource_list_rejects_oversized_records_before_projection() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:oversized-record";
+        state
+            .data
+            .write(
+                format!("resource-records/{}", did_to_file_name(resource_did)),
+                &json!({
+                    "resourceDid": resource_did,
+                    "resourceType": "skill",
+                    "packageVersion": "1",
+                    "didDocumentHash": "sha256:did",
+                    "metadataHash": "sha256:metadata",
+                    "packageHash": "sha256:package",
+                    "authorizedDomains": ["technology"],
+                    "submittedAt": "2026-09-18T00:00:00Z",
+                    "diagnosticPayload": "x".repeat(REGISTRAR_MAX_RECORD_BYTES)
+                }),
+            )
+            .unwrap();
+
+        let err = api_resources(State(state), Query(ResourceListQuery::default()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "resource_record_too_large");
     }
 
     #[tokio::test]
