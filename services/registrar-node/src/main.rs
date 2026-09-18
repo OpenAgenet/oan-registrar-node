@@ -1066,10 +1066,11 @@ async fn api_resource_detail(
 ) -> ApiResult<Value> {
     let record = read_resource_record(&state, &did)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found("resource_not_found"))?;
     Ok(Json(json!({
         "resourceDid": did,
-        "record": record.as_ref().map(public_resource_record_projection)
+        "record": public_resource_record_projection(&record)
     })))
 }
 
@@ -1950,6 +1951,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_detail_returns_not_found_for_missing_record() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+
+        let err = api_resource_detail(
+            State(state),
+            AxumPath("did:oan:SKLG:missing-resource".to_owned()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.message, "resource_not_found");
+    }
+
+    #[tokio::test]
     async fn registration_credential_query_returns_vc_for_authorized_new_record() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
@@ -2119,6 +2136,90 @@ mod tests {
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "invalid_registration_credential_query");
+    }
+
+    #[tokio::test]
+    async fn registration_credential_query_rejects_expired_challenge() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:query-expired";
+        let controller_did = "did:oan:AGUS:ExpiredController";
+        let mut request = controller_query_request(
+            &state,
+            resource_did,
+            controller_did,
+            "query-nonce-expired",
+        );
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "registrationCredential": {
+                    "proof": {
+                        "proofValue": "secret-proof"
+                    }
+                },
+                "registrationCredentialAccess": credential_access_marker(&state, &request)
+            }),
+        )
+        .await
+        .unwrap();
+        request.challenge.request_timestamp =
+            Utc::now() - Duration::seconds(REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS + 1);
+
+        let err = api_registration_credential(
+            State(state),
+            AxumPath(resource_did.to_owned()),
+            Json(request),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "registration_credential_query_expired");
+    }
+
+    #[tokio::test]
+    async fn registration_credential_query_rejects_controller_method_hash_mismatch() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let resource_did = "did:oan:SKLG:query-method-hash-mismatch";
+        let controller_did = "did:oan:AGUS:MethodHashMismatchController";
+        let request = controller_query_request(
+            &state,
+            resource_did,
+            controller_did,
+            "query-nonce-method-hash-mismatch",
+        );
+        let mut access_marker = credential_access_marker(&state, &request);
+        access_marker["verifiedControllerMethodHash"] = json!("sha256:mismatch");
+        write_resource_record(
+            &state,
+            &json!({
+                "resourceDid": resource_did,
+                "resourceType": "skill",
+                "registrationCredential": {
+                    "proof": {
+                        "proofValue": "secret-proof"
+                    }
+                },
+                "registrationCredentialAccess": access_marker
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = api_registration_credential(
+            State(state),
+            AxumPath(resource_did.to_owned()),
+            Json(request),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.message, "registration_credential_access_denied");
     }
 
     #[tokio::test]
