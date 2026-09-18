@@ -2184,8 +2184,14 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(first["count"], 2);
-        assert_eq!(first["items"][0]["resourceDid"], "did:oan:SKLG:pagination-a");
-        assert_eq!(first["items"][1]["resourceDid"], "did:oan:SKLG:pagination-b");
+        assert_eq!(
+            first["items"][0]["resourceDid"],
+            "did:oan:SKLG:pagination-a"
+        );
+        assert_eq!(
+            first["items"][1]["resourceDid"],
+            "did:oan:SKLG:pagination-b"
+        );
         assert_eq!(first["nextDid"], "did:oan:SKLG:pagination-b");
         assert_eq!(first["hasMore"], true);
 
@@ -2200,7 +2206,10 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(second["count"], 1);
-        assert_eq!(second["items"][0]["resourceDid"], "did:oan:SKLG:pagination-c");
+        assert_eq!(
+            second["items"][0]["resourceDid"],
+            "did:oan:SKLG:pagination-c"
+        );
         assert_eq!(second["hasMore"], false);
         assert!(second["nextDid"].is_null());
     }
