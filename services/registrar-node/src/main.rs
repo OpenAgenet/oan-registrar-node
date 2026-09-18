@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -42,6 +42,7 @@ use oan_storage::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::{
     env,
     net::SocketAddr,
@@ -168,6 +169,16 @@ struct AppState {
     client: reqwest::Client,
     recommender: Arc<SemanticRecommender>,
 }
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ResourceListQuery {
+    #[serde(rename = "afterDid")]
+    after_did: Option<String>,
+    limit: Option<u32>,
+}
+
+const REGISTRAR_DEFAULT_PAGE_SIZE: u32 = 100;
+const REGISTRAR_MAX_PAGE_SIZE: u32 = 500;
 
 #[derive(Clone, Debug, Deserialize)]
 struct DevKeyFile {
@@ -869,14 +880,34 @@ async fn read_resource_record(state: &AppState, did: &str) -> Result<Option<Valu
         .ok())
 }
 
+async fn resource_record_count(state: &AppState) -> Result<usize> {
+    if let Some(sqlite) = &state.sqlite {
+        return Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM json_records WHERE namespace = ?",
+        )
+        .bind("registrar.resource_records")
+        .fetch_one(sqlite.pool())
+        .await? as usize);
+    }
+    if let Some(postgres) = &state.postgres {
+        return Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM json_records WHERE namespace = $1",
+        )
+        .bind("registrar.resource_records")
+        .fetch_one(postgres.pool())
+        .await? as usize);
+    }
+    Ok(read_resource_records(state).await?.len())
+}
+
 async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
-    let records = read_resource_records(&state)
+    let resource_count = resource_record_count(&state)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({
         "registrarDid": state.did,
         "rootEndpoint": state.config.upstream.root_endpoint,
-        "resourceRecordCount": records.len(),
+        "resourceRecordCount": resource_count,
         "protocolVersion": OAN_RESOURCE_PROTOCOL_VERSION
     })))
 }
@@ -889,67 +920,151 @@ async fn api_stats(State(state): State<AppState>) -> ApiResult<Value> {
 }
 
 async fn registrar_stats_body(state: &AppState) -> Result<Value> {
-    let records = read_resource_records(&state).await?;
     let generated_at = Utc::now();
     let today = generated_at.date_naive();
     let week_start = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
     let month_start = today.with_day(1).unwrap_or(today);
-    let mut counts = json!({
-        "agentServiceCount": 0,
-        "skillCount": 0,
-        "mcpServerCount": 0,
-        "toolApiCount": 0,
-        "todayRegistrationCount": 0,
-        "weekRegistrationCount": 0,
-        "monthRegistrationCount": 0,
-        "resourceRecordCount": records.len(),
-    });
-    for record in &records {
-        if let Some(resource_type) = record.get("resourceType").and_then(Value::as_str) {
-            let key = match resource_type {
-                "agent_service" => "agentServiceCount",
-                "skill" => "skillCount",
-                "mcp_server" => "mcpServerCount",
-                "tool_api" => "toolApiCount",
-                _ => "",
-            };
-            if !key.is_empty() {
-                counts[key] = json!(counts[key].as_i64().unwrap_or(0) + 1);
-            }
+    let today_text = today.to_string();
+    let week_start_text = week_start.to_string();
+    let month_start_text = month_start.to_string();
+    let (resource_record_count, type_counts, today_count, week_count, month_count) = if let Some(
+        sqlite,
+    ) =
+        &state.sqlite
+    {
+        let row = sqlx::query(
+                "SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'agent_service' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'skill' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'mcp_server' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN json_extract(value_json, '$.resourceType') = 'tool_api' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN substr(json_extract(value_json, '$.submittedAt'), 1, 10) = ? THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN substr(json_extract(value_json, '$.submittedAt'), 1, 10) >= ? THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN substr(json_extract(value_json, '$.submittedAt'), 1, 10) >= ? THEN 1 ELSE 0 END)
+                 FROM json_records
+                 WHERE namespace = ?",
+            )
+            .bind(&today_text)
+            .bind(&week_start_text)
+            .bind(&month_start_text)
+            .bind("registrar.resource_records")
+            .fetch_one(sqlite.pool())
+            .await?;
+        (
+            row.get::<i64, _>(0) as usize,
+            [
+                row.get::<Option<i64>, _>(1).unwrap_or(0),
+                row.get::<Option<i64>, _>(2).unwrap_or(0),
+                row.get::<Option<i64>, _>(3).unwrap_or(0),
+                row.get::<Option<i64>, _>(4).unwrap_or(0),
+            ],
+            row.get::<Option<i64>, _>(5).unwrap_or(0),
+            row.get::<Option<i64>, _>(6).unwrap_or(0),
+            row.get::<Option<i64>, _>(7).unwrap_or(0),
+        )
+    } else if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(
+            "SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'agent_service'),
+                    COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'skill'),
+                    COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'mcp_server'),
+                    COUNT(*) FILTER (WHERE value_json::jsonb ->> 'resourceType' = 'tool_api'),
+                    COUNT(*) FILTER (WHERE LEFT(value_json::jsonb ->> 'submittedAt', 10) = $1),
+                    COUNT(*) FILTER (WHERE LEFT(value_json::jsonb ->> 'submittedAt', 10) >= $2),
+                    COUNT(*) FILTER (WHERE LEFT(value_json::jsonb ->> 'submittedAt', 10) >= $3)
+                 FROM json_records
+                 WHERE namespace = $4",
+        )
+        .bind(&today_text)
+        .bind(&week_start_text)
+        .bind(&month_start_text)
+        .bind("registrar.resource_records")
+        .fetch_one(postgres.pool())
+        .await?;
+        (
+            row.get::<i64, _>(0) as usize,
+            [
+                row.get::<i64, _>(1),
+                row.get::<i64, _>(2),
+                row.get::<i64, _>(3),
+                row.get::<i64, _>(4),
+            ],
+            row.get::<i64, _>(5),
+            row.get::<i64, _>(6),
+            row.get::<i64, _>(7),
+        )
+    } else {
+        let records = read_resource_records(state).await?;
+        let mut type_counts = [0_i64; 4];
+        let mut today_count = 0_i64;
+        let mut week_count = 0_i64;
+        let mut month_count = 0_i64;
+        for record in &records {
+            accumulate_registrar_stats(
+                record,
+                &mut type_counts,
+                &mut today_count,
+                &mut week_count,
+                &mut month_count,
+                (today, week_start, month_start),
+            );
         }
-        let Some(submitted_at) = record.get("submittedAt").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(submitted_at) = DateTime::parse_from_rfc3339(submitted_at) else {
-            continue;
-        };
-        let submitted_day = submitted_at.with_timezone(&Utc).date_naive();
-        if submitted_day == today {
-            counts["todayRegistrationCount"] =
-                json!(counts["todayRegistrationCount"].as_i64().unwrap_or(0) + 1);
-        }
-        if submitted_day >= week_start {
-            counts["weekRegistrationCount"] =
-                json!(counts["weekRegistrationCount"].as_i64().unwrap_or(0) + 1);
-        }
-        if submitted_day >= month_start {
-            counts["monthRegistrationCount"] =
-                json!(counts["monthRegistrationCount"].as_i64().unwrap_or(0) + 1);
-        }
-    }
+        (
+            records.len(),
+            type_counts,
+            today_count,
+            week_count,
+            month_count,
+        )
+    };
     Ok(json!({
         "registrarDid": state.did,
         "generatedAt": generated_at.to_rfc3339(),
         "windowTimezone": "UTC",
-        "resourceRecordCount": counts["resourceRecordCount"],
-        "agentServiceCount": counts["agentServiceCount"],
-        "skillCount": counts["skillCount"],
-        "mcpServerCount": counts["mcpServerCount"],
-        "toolApiCount": counts["toolApiCount"],
-        "todayRegistrationCount": counts["todayRegistrationCount"],
-        "weekRegistrationCount": counts["weekRegistrationCount"],
-        "monthRegistrationCount": counts["monthRegistrationCount"],
+        "resourceRecordCount": resource_record_count,
+        "agentServiceCount": type_counts[0],
+        "skillCount": type_counts[1],
+        "mcpServerCount": type_counts[2],
+        "toolApiCount": type_counts[3],
+        "todayRegistrationCount": today_count,
+        "weekRegistrationCount": week_count,
+        "monthRegistrationCount": month_count,
     }))
+}
+
+fn accumulate_registrar_stats(
+    record: &Value,
+    type_counts: &mut [i64; 4],
+    today_count: &mut i64,
+    week_count: &mut i64,
+    month_count: &mut i64,
+    (today, week_start, month_start): (chrono::NaiveDate, chrono::NaiveDate, chrono::NaiveDate),
+) {
+    match record.get("resourceType").and_then(Value::as_str) {
+        Some("agent_service") => type_counts[0] += 1,
+        Some("skill") => type_counts[1] += 1,
+        Some("mcp_server") => type_counts[2] += 1,
+        Some("tool_api") => type_counts[3] += 1,
+        _ => {}
+    }
+    let Some(submitted_at) = record.get("submittedAt").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(submitted_at) = DateTime::parse_from_rfc3339(submitted_at) else {
+        return;
+    };
+    let submitted_day = submitted_at.with_timezone(&Utc).date_naive();
+    if submitted_day == today {
+        *today_count += 1;
+    }
+    if submitted_day >= week_start {
+        *week_count += 1;
+    }
+    if submitted_day >= month_start {
+        *month_count += 1;
+    }
 }
 
 async fn registrar_stats_report_loop(state: AppState) {
@@ -1049,15 +1164,93 @@ async fn api_root_authorization(State(state): State<AppState>) -> ApiResult<Valu
     }
 }
 
-async fn api_resources(State(state): State<AppState>) -> ApiResult<Value> {
-    let records = read_resource_records(&state)
+async fn api_resources(
+    State(state): State<AppState>,
+    Query(query): Query<ResourceListQuery>,
+) -> ApiResult<Value> {
+    let limit = query.limit.unwrap_or(REGISTRAR_DEFAULT_PAGE_SIZE);
+    if limit == 0 || limit > REGISTRAR_MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request("invalid_resource_page_limit"));
+    }
+    let after_did = query.after_did.as_deref().unwrap_or("");
+    let mut items = Vec::new();
+    let mut has_more = false;
+    let mut next_did = None;
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(
+            "SELECT record_key, value_json FROM json_records
+             WHERE namespace = ? AND record_key > ?
+             ORDER BY record_key LIMIT ?",
+        )
+        .bind("registrar.resource_records")
+        .bind(after_did)
+        .bind(i64::from(limit + 1))
+        .fetch_all(sqlite.pool())
         .await
         .map_err(ApiError::internal)?;
-    let items: Vec<Value> = records
-        .iter()
-        .map(public_resource_record_projection)
-        .collect();
-    Ok(Json(json!({ "items": items, "count": items.len() })))
+        for (index, row) in rows.into_iter().enumerate() {
+            if index >= limit as usize {
+                has_more = true;
+                break;
+            }
+            let did = row.get::<String, _>(0);
+            next_did = Some(did);
+            let record: Value =
+                serde_json::from_str(&row.get::<String, _>(1)).map_err(ApiError::internal)?;
+            items.push(public_resource_record_projection(&record));
+        }
+    } else if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(
+            "SELECT record_key, value_json::text FROM json_records
+             WHERE namespace = $1 AND record_key > $2
+             ORDER BY record_key LIMIT $3",
+        )
+        .bind("registrar.resource_records")
+        .bind(after_did)
+        .bind(i64::from(limit + 1))
+        .fetch_all(postgres.pool())
+        .await
+        .map_err(ApiError::internal)?;
+        for (index, row) in rows.into_iter().enumerate() {
+            if index >= limit as usize {
+                has_more = true;
+                break;
+            }
+            let did = row.get::<String, _>(0);
+            next_did = Some(did);
+            let record: Value =
+                serde_json::from_str(&row.get::<String, _>(1)).map_err(ApiError::internal)?;
+            items.push(public_resource_record_projection(&record));
+        }
+    } else {
+        let records = read_resource_records(&state)
+            .await
+            .map_err(ApiError::internal)?;
+        let mut records = records
+            .iter()
+            .filter_map(|record| {
+                let did = record.get("resourceDid")?.as_str()?;
+                (did > after_did).then_some((did.to_owned(), record))
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        has_more = records.len() > limit as usize;
+        records.truncate(limit as usize);
+        for (did, record) in records {
+            next_did = Some(did);
+            items.push(public_resource_record_projection(record));
+        }
+    }
+    if !has_more {
+        next_did = None;
+    }
+    Ok(Json(json!({
+        "items": items,
+        "count": items.len(),
+        "afterDid": if after_did.is_empty() { Value::Null } else { json!(after_did) },
+        "nextDid": next_did,
+        "hasMore": has_more
+    })))
 }
 
 async fn api_resource_detail(
@@ -1931,7 +2124,10 @@ mod tests {
             .get("registrationCredentialAccess")
             .is_none());
 
-        let list = api_resources(State(state.clone())).await.unwrap().0;
+        let list = api_resources(State(state.clone()), Query(ResourceListQuery::default()))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(list["count"], 1);
         assert_eq!(list["items"][0]["resourceDid"], resource_did);
         assert!(list["items"][0].get("registrationCredential").is_none());
@@ -1948,6 +2144,65 @@ mod tests {
             stored["registrationCredential"]["proof"]["proofValue"],
             "secret-proof"
         );
+    }
+
+    #[tokio::test]
+    async fn resource_list_uses_after_did_pagination() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        for did in [
+            "did:oan:SKLG:pagination-a",
+            "did:oan:SKLG:pagination-b",
+            "did:oan:SKLG:pagination-c",
+        ] {
+            state
+                .data
+                .write(
+                    format!("resource-records/{}", did_to_file_name(did)),
+                    &json!({
+                        "resourceDid": did,
+                        "resourceType": "skill",
+                        "packageVersion": "1",
+                        "didDocumentHash": "sha256:did",
+                        "metadataHash": "sha256:metadata",
+                        "packageHash": "sha256:package",
+                        "authorizedDomains": ["technology"],
+                        "submittedAt": "2026-09-18T00:00:00Z"
+                    }),
+                )
+                .unwrap();
+        }
+
+        let first = api_resources(
+            State(state.clone()),
+            Query(ResourceListQuery {
+                after_did: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first["count"], 2);
+        assert_eq!(first["items"][0]["resourceDid"], "did:oan:SKLG:pagination-a");
+        assert_eq!(first["items"][1]["resourceDid"], "did:oan:SKLG:pagination-b");
+        assert_eq!(first["nextDid"], "did:oan:SKLG:pagination-b");
+        assert_eq!(first["hasMore"], true);
+
+        let second = api_resources(
+            State(state),
+            Query(ResourceListQuery {
+                after_did: Some("did:oan:SKLG:pagination-b".to_owned()),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(second["count"], 1);
+        assert_eq!(second["items"][0]["resourceDid"], "did:oan:SKLG:pagination-c");
+        assert_eq!(second["hasMore"], false);
+        assert!(second["nextDid"].is_null());
     }
 
     #[tokio::test]
@@ -2144,12 +2399,8 @@ mod tests {
         let state = app_state(dir.path());
         let resource_did = "did:oan:SKLG:query-expired";
         let controller_did = "did:oan:AGUS:ExpiredController";
-        let mut request = controller_query_request(
-            &state,
-            resource_did,
-            controller_did,
-            "query-nonce-expired",
-        );
+        let mut request =
+            controller_query_request(&state, resource_did, controller_did, "query-nonce-expired");
         write_resource_record(
             &state,
             &json!({
@@ -2165,8 +2416,8 @@ mod tests {
         )
         .await
         .unwrap();
-        request.challenge.request_timestamp =
-            Utc::now() - Duration::seconds(REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS + 1);
+        request.challenge.request_timestamp = Utc::now()
+            - Duration::seconds(REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS + 1);
 
         let err = api_registration_credential(
             State(state),
