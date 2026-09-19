@@ -1177,7 +1177,7 @@ async fn api_resources(
     }
     let after_did = query.after_did.as_deref().unwrap_or("");
     let mut items = Vec::new();
-    let mut has_more = false;
+    let has_more;
     let mut next_did = None;
     let mut page_bytes = 0_usize;
     if let Some(sqlite) = &state.sqlite {
