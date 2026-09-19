@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Datelike, Duration, Utc};
+use futures::TryStreamExt;
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
 use oan_credentials::sign_credential;
 use oan_crypto::{
@@ -1180,22 +1181,16 @@ async fn api_resources(
     let mut next_did = None;
     let mut page_bytes = 0_usize;
     if let Some(sqlite) = &state.sqlite {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT record_key, value_json FROM json_records
              WHERE namespace = ? AND record_key > ?
              ORDER BY record_key LIMIT ?",
         )
         .bind("registrar.resource_records")
         .bind(after_did)
-        .bind(i64::from(limit + 1))
-        .fetch_all(sqlite.pool())
-        .await
-        .map_err(ApiError::internal)?;
-        for (index, row) in rows.into_iter().enumerate() {
-            if index >= limit as usize {
-                has_more = true;
-                break;
-            }
+        .bind(i64::from(limit))
+        .fetch(sqlite.pool());
+        while let Some(row) = rows.try_next().await.map_err(ApiError::internal)? {
             let did = row.get::<String, _>(0);
             next_did = Some(did);
             let value_json = row.get::<String, _>(1);
@@ -1204,23 +1199,29 @@ async fn api_resources(
                 &mut page_bytes,
             )?);
         }
+        let probe_after = next_did.as_deref().unwrap_or(after_did);
+        has_more = sqlx::query(
+            "SELECT 1 FROM json_records
+             WHERE namespace = ? AND record_key > ?
+             LIMIT 1",
+        )
+        .bind("registrar.resource_records")
+        .bind(probe_after)
+        .fetch_optional(sqlite.pool())
+        .await
+        .map_err(ApiError::internal)?
+        .is_some();
     } else if let Some(postgres) = &state.postgres {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT record_key, value_json::text FROM json_records
              WHERE namespace = $1 AND record_key > $2
              ORDER BY record_key LIMIT $3",
         )
         .bind("registrar.resource_records")
         .bind(after_did)
-        .bind(i64::from(limit + 1))
-        .fetch_all(postgres.pool())
-        .await
-        .map_err(ApiError::internal)?;
-        for (index, row) in rows.into_iter().enumerate() {
-            if index >= limit as usize {
-                has_more = true;
-                break;
-            }
+        .bind(i64::from(limit))
+        .fetch(postgres.pool());
+        while let Some(row) = rows.try_next().await.map_err(ApiError::internal)? {
             let did = row.get::<String, _>(0);
             next_did = Some(did);
             let value_json = row.get::<String, _>(1);
@@ -1229,6 +1230,18 @@ async fn api_resources(
                 &mut page_bytes,
             )?);
         }
+        let probe_after = next_did.as_deref().unwrap_or(after_did);
+        has_more = sqlx::query(
+            "SELECT 1 FROM json_records
+             WHERE namespace = $1 AND record_key > $2
+             LIMIT 1",
+        )
+        .bind("registrar.resource_records")
+        .bind(probe_after)
+        .fetch_optional(postgres.pool())
+        .await
+        .map_err(ApiError::internal)?
+        .is_some();
     } else {
         let records = read_resource_records(&state)
             .await
@@ -2239,6 +2252,96 @@ mod tests {
         );
         assert_eq!(second["hasMore"], false);
         assert!(second["nextDid"].is_null());
+    }
+
+    #[tokio::test]
+    async fn sqlite_resource_list_stops_before_an_oversized_extra_row() {
+        let dir = tempdir().unwrap();
+        let sqlite = SqliteJsonStore::connect(&format!(
+            "sqlite:{}",
+            dir.path().join("registrar.db").display()
+        ))
+        .await
+        .unwrap();
+        let mut state = app_state(dir.path());
+        state.sqlite = Some(sqlite);
+
+        for (index, did) in ["did:oan:SKLG:stream-a", "did:oan:SKLG:stream-b"]
+            .into_iter()
+            .enumerate()
+        {
+            state
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .upsert_json(
+                    "registrar.resource_records",
+                    did,
+                    &json!({
+                        "resourceDid": did,
+                        "resourceType": "skill",
+                        "packageVersion": "1",
+                        "didDocumentHash": format!("sha256:did-{index}"),
+                        "metadataHash": format!("sha256:metadata-{index}"),
+                        "packageHash": format!("sha256:package-{index}"),
+                        "authorizedDomains": ["technology"],
+                        "submittedAt": "2026-09-18T00:00:00Z"
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        state
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .upsert_json(
+                "registrar.resource_records",
+                "did:oan:SKLG:stream-c",
+                &json!({
+                    "resourceDid": "did:oan:SKLG:stream-c",
+                    "resourceType": "skill",
+                    "diagnosticPayload": "x".repeat(REGISTRAR_MAX_RECORD_BYTES)
+                }),
+            )
+            .await
+            .unwrap();
+
+        let page = api_resources(
+            State(state),
+            Query(ResourceListQuery {
+                after_did: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(page["count"], 2);
+        assert_eq!(page["hasMore"], true);
+        assert_eq!(page["nextDid"], "did:oan:SKLG:stream-b");
+    }
+
+    #[tokio::test]
+    async fn resource_list_rejects_invalid_page_limits() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+
+        for limit in [Some(0), Some(REGISTRAR_MAX_PAGE_SIZE + 1)] {
+            let err = api_resources(
+                State(state.clone()),
+                Query(ResourceListQuery {
+                    after_did: None,
+                    limit,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.message, "invalid_resource_page_limit");
+        }
     }
 
     #[tokio::test]

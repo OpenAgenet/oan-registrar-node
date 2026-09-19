@@ -11,6 +11,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+futures.workspace = true
 oan-core.workspace = true
 oan-credentials.workspace = true
 oan-crypto.workspace = true
