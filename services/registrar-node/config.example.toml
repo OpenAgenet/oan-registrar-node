@@ -21,7 +21,7 @@ root_endpoint = "http://localhost:8000"
 
 [security.upstream]
 protocol_label = "ans-2026"
-root_did = "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
+root_did = "did:oan:QwErT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
 
 [security.submit]
 max_in_flight = 32

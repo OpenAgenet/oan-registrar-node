@@ -152,7 +152,7 @@ fn default_registration_credential_query_nonce_file() -> PathBuf {
 }
 
 fn default_root_did() -> String {
-    "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
+    "did:oan:QwErT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
 }
 
 fn default_stats_report_interval_seconds() -> u64 {
@@ -765,6 +765,18 @@ fn issue_resource_registration_credential(
         .as_ref()
         .map(|metadata| metadata.authorized_domains.clone())
         .unwrap_or_default();
+    let external_identifiers = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| {
+            metadata
+                .external_identifiers
+                .iter()
+                .map(|identifier| json!({ "id": identifier.id }))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut credential = json!({
         "@context": [
             "https://www.w3.org/2018/credentials/v1",
@@ -787,6 +799,7 @@ fn issue_resource_registration_credential(
             "packageVersion": submission.package_version,
             "hashAlgorithm": submission.hash_algorithm,
             "authorizedDomains": authorized_domains,
+            "externalIdentifiers": external_identifiers,
             "lifecycleState": submission.metadata["lifecycleState"].as_str().unwrap_or("active")
         },
         "credentialStatus": {
@@ -1643,7 +1656,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use oan_core::{
         OanMetadata, ProtocolBinding, ResourceDescription, ResourceType, ServiceEndpoint,
-        VerificationMethod,
+        SubjectType, VerificationMethod,
     };
     use oan_crypto::{generate_ed25519_keypair, public_key_multibase, VerifyingKey};
     use oan_protocol::{
@@ -1664,7 +1677,7 @@ mod tests {
                 cors: CorsConfig::default(),
                 security: SecurityConfig {
                     upstream: UpstreamSecurityConfig {
-                        root_did: "did:oan:AGRT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+                        root_did: "did:oan:QwErT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
                     },
                 },
                 stats_report: StatsReportConfig::default(),
@@ -1682,7 +1695,7 @@ mod tests {
                     database_url: None,
                 },
             },
-            did: "did:oan:AGRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+            did: "did:oan:P9aBc:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
             signing_key: SigningKey::Ed25519 {
                 suite: CryptoSuite::Ed25519Sha256,
                 key,
@@ -1703,6 +1716,7 @@ mod tests {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.to_owned(),
+            controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: format!("{did}#key-1"),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -1724,10 +1738,20 @@ mod tests {
                 server_type: None,
                 port: None,
             }],
+            proof: Some(oan_core::DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: format!("{did}#key-1"),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: "fixture".to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+                verification_method: Some(format!("{did}#key-1")),
+            }),
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::Skill,
+                subject_type: SubjectType::Skill,
                 resource_type: ResourceType::Skill,
-                node_role: None,
+                external_identifiers: vec![],
                 identity_type: None,
                 controller_did: None,
                 publisher_did: None,
@@ -1763,7 +1787,7 @@ mod tests {
     }
 
     fn sample_submission() -> ResourceRegistrationSubmission {
-        let did = "did:oan:SKLG:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
+        let did = "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
         let document = sample_document(did);
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &document).unwrap();
@@ -1784,7 +1808,7 @@ mod tests {
                     draft_id: "resource-draft-1".to_owned(),
                     subject_did: did.to_owned(),
                     did_document_hash: format!("sha256:{did_document_hash}"),
-                    registrar_did: "did:oan:AGRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+                    registrar_did: "did:oan:P9aBc:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
                     purpose: "resource-registration".to_owned(),
                     verification_method: format!("{did}#key-1"),
                     nonce: "nonce-1".to_owned(),
@@ -1822,6 +1846,7 @@ mod tests {
         let controller_document = DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: controller_did.to_owned(),
+            controller: Some(oan_core::DidController::Did(controller_did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: controller_method.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -1835,9 +1860,15 @@ mod tests {
             assertion_method: vec![controller_method.clone()],
             capability_invocation: vec![controller_method.clone()],
             service: vec![],
+            proof: None,
             oan_metadata: None,
         };
         let metadata = submission.did_document.oan_metadata.as_mut().unwrap();
+        submission.did_document.controller =
+            Some(oan_core::DidController::Did(controller_did.to_owned()));
+        if let Some(method) = submission.did_document.verification_method.first_mut() {
+            method.controller = controller_did.to_owned();
+        }
         metadata.controller_did = Some(controller_did.to_owned());
         metadata.publisher_did = Some(controller_did.to_owned());
         let did_document_hash =
@@ -1852,7 +1883,7 @@ mod tests {
             publisher_did: Some(controller_did.to_owned()),
             did_document_hash: submission.did_document_hash.clone(),
             metadata_hash: submission.metadata_hash.clone(),
-            registrar_did: "did:oan:AGRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+            registrar_did: "did:oan:P9aBc:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
             purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION.to_owned(),
             verification_method: controller_method.clone(),
             nonce: "controller-auth-nonce".to_owned(),
@@ -1892,6 +1923,7 @@ mod tests {
         let controller_document = DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: controller_did.to_owned(),
+            controller: Some(oan_core::DidController::Did(controller_did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: controller_method.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -1905,6 +1937,7 @@ mod tests {
             assertion_method: vec![controller_method.clone()],
             capability_invocation: vec![controller_method.clone()],
             service: vec![],
+            proof: None,
             oan_metadata: None,
         };
         let challenge = RegistrationCredentialQueryChallenge {
@@ -2049,7 +2082,7 @@ mod tests {
         write_resource_record(
             &state,
             &json!({
-                "resourceDid": "did:oan:SKLG:today",
+                "resourceDid": "did:oan:K7mQ9:today",
                 "resourceType": "skill",
                 "submittedAt": Utc::now().to_rfc3339()
             }),
@@ -2059,7 +2092,7 @@ mod tests {
         write_resource_record(
             &state,
             &json!({
-                "resourceDid": "did:oan:MCPS:old",
+                "resourceDid": "did:oan:K7mQ9:old",
                 "resourceType": "mcp_server",
                 "submittedAt": (Utc::now() - Duration::days(40)).to_rfc3339()
             }),
@@ -2073,7 +2106,7 @@ mod tests {
     #[test]
     fn public_resource_record_projection_redacts_sensitive_fields() {
         let record = json!({
-            "resourceDid": "did:oan:SKLG:redaction",
+            "resourceDid": "did:oan:K7mQ9:redaction",
             "resourceType": "skill",
             "packageVersion": "1",
             "didDocumentHash": "sha256:did",
@@ -2094,7 +2127,7 @@ mod tests {
             },
             "registrationCredentialAccess": {
                 "enabled": true,
-                "controllerDid": "did:oan:AGUS:controller",
+                "controllerDid": "did:oan:R4tYu:controller",
                 "verifiedAuthorityBindingHash": "sha256:binding"
             },
             "databasePath": "/internal/registrar.db"
@@ -2102,7 +2135,7 @@ mod tests {
 
         let projection = public_resource_record_projection(&record);
 
-        assert_eq!(projection["resourceDid"], "did:oan:SKLG:redaction");
+        assert_eq!(projection["resourceDid"], "did:oan:K7mQ9:redaction");
         assert_eq!(projection["resourceType"], "skill");
         assert_eq!(projection["rootStatus"], "resource-verified-and-queued");
         assert!(projection.get("registrationCredential").is_none());
@@ -2116,7 +2149,7 @@ mod tests {
     async fn resource_get_handlers_return_redacted_public_projection() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:redacted-handler";
+        let resource_did = "did:oan:K7mQ9:redacted-handler";
         write_resource_record(
             &state,
             &json!({
@@ -2140,7 +2173,7 @@ mod tests {
                 },
                 "registrationCredentialAccess": {
                     "enabled": true,
-                    "controllerDid": "did:oan:AGUS:controller",
+                    "controllerDid": "did:oan:R4tYu:controller",
                     "verifiedAuthorityBindingHash": "sha256:binding"
                 }
             }),
@@ -2191,9 +2224,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
         for did in [
-            "did:oan:SKLG:pagination-a",
-            "did:oan:SKLG:pagination-b",
-            "did:oan:SKLG:pagination-c",
+            "did:oan:K7mQ9:pagination-a",
+            "did:oan:K7mQ9:pagination-b",
+            "did:oan:K7mQ9:pagination-c",
         ] {
             state
                 .data
@@ -2226,19 +2259,19 @@ mod tests {
         assert_eq!(first["count"], 2);
         assert_eq!(
             first["items"][0]["resourceDid"],
-            "did:oan:SKLG:pagination-a"
+            "did:oan:K7mQ9:pagination-a"
         );
         assert_eq!(
             first["items"][1]["resourceDid"],
-            "did:oan:SKLG:pagination-b"
+            "did:oan:K7mQ9:pagination-b"
         );
-        assert_eq!(first["nextDid"], "did:oan:SKLG:pagination-b");
+        assert_eq!(first["nextDid"], "did:oan:K7mQ9:pagination-b");
         assert_eq!(first["hasMore"], true);
 
         let second = api_resources(
             State(state),
             Query(ResourceListQuery {
-                after_did: Some("did:oan:SKLG:pagination-b".to_owned()),
+                after_did: Some("did:oan:K7mQ9:pagination-b".to_owned()),
                 limit: Some(2),
             }),
         )
@@ -2248,7 +2281,7 @@ mod tests {
         assert_eq!(second["count"], 1);
         assert_eq!(
             second["items"][0]["resourceDid"],
-            "did:oan:SKLG:pagination-c"
+            "did:oan:K7mQ9:pagination-c"
         );
         assert_eq!(second["hasMore"], false);
         assert!(second["nextDid"].is_null());
@@ -2266,7 +2299,7 @@ mod tests {
         let mut state = app_state(dir.path());
         state.sqlite = Some(sqlite);
 
-        for (index, did) in ["did:oan:SKLG:stream-a", "did:oan:SKLG:stream-b"]
+        for (index, did) in ["did:oan:K7mQ9:stream-a", "did:oan:K7mQ9:stream-b"]
             .into_iter()
             .enumerate()
         {
@@ -2297,9 +2330,9 @@ mod tests {
             .unwrap()
             .upsert_json(
                 "registrar.resource_records",
-                "did:oan:SKLG:stream-c",
+                "did:oan:K7mQ9:stream-c",
                 &json!({
-                    "resourceDid": "did:oan:SKLG:stream-c",
+                    "resourceDid": "did:oan:K7mQ9:stream-c",
                     "resourceType": "skill",
                     "diagnosticPayload": "x".repeat(REGISTRAR_MAX_RECORD_BYTES)
                 }),
@@ -2320,7 +2353,7 @@ mod tests {
 
         assert_eq!(page["count"], 2);
         assert_eq!(page["hasMore"], true);
-        assert_eq!(page["nextDid"], "did:oan:SKLG:stream-b");
+        assert_eq!(page["nextDid"], "did:oan:K7mQ9:stream-b");
     }
 
     #[tokio::test]
@@ -2348,7 +2381,7 @@ mod tests {
     async fn resource_list_rejects_oversized_records_before_projection() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:oversized-record";
+        let resource_did = "did:oan:K7mQ9:oversized-record";
         state
             .data
             .write(
@@ -2382,7 +2415,7 @@ mod tests {
 
         let err = api_resource_detail(
             State(state),
-            AxumPath("did:oan:SKLG:missing-resource".to_owned()),
+            AxumPath("did:oan:K7mQ9:missing-resource".to_owned()),
         )
         .await
         .unwrap_err();
@@ -2395,8 +2428,8 @@ mod tests {
     async fn registration_credential_query_returns_vc_for_authorized_new_record() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:credential-query";
-        let controller_did = "did:oan:AGUS:CredentialQueryController";
+        let resource_did = "did:oan:K7mQ9:credential-query";
+        let controller_did = "did:oan:R4tYu:CredentialQueryController";
         let request =
             controller_query_request(&state, resource_did, controller_did, "query-nonce-1");
         write_resource_record(
@@ -2434,8 +2467,8 @@ mod tests {
     async fn registration_credential_query_rejects_record_without_access_marker() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:no-access-marker-query";
-        let controller_did = "did:oan:AGUS:NoAccessMarkerController";
+        let resource_did = "did:oan:K7mQ9:no-access-marker-query";
+        let controller_did = "did:oan:R4tYu:NoAccessMarkerController";
         write_resource_record(
             &state,
             &json!({
@@ -2473,8 +2506,8 @@ mod tests {
     async fn registration_credential_query_rejects_controller_mismatch_and_replay() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:query-replay";
-        let controller_did = "did:oan:AGUS:ExpectedController";
+        let resource_did = "did:oan:K7mQ9:query-replay";
+        let controller_did = "did:oan:R4tYu:ExpectedController";
         let request =
             controller_query_request(&state, resource_did, controller_did, "query-nonce-replay");
         write_resource_record(
@@ -2496,7 +2529,7 @@ mod tests {
         let wrong_controller_request = controller_query_request(
             &state,
             resource_did,
-            "did:oan:AGUS:WrongController",
+            "did:oan:R4tYu:WrongController",
             "query-nonce-wrong-controller",
         );
         let err = api_registration_credential(
@@ -2530,8 +2563,8 @@ mod tests {
     async fn registration_credential_query_rejects_tampered_challenge_binding() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:query-tamper";
-        let controller_did = "did:oan:AGUS:TamperController";
+        let resource_did = "did:oan:K7mQ9:query-tamper";
+        let controller_did = "did:oan:R4tYu:TamperController";
         let mut request =
             controller_query_request(&state, resource_did, controller_did, "query-nonce-tamper");
         write_resource_record(
@@ -2567,8 +2600,8 @@ mod tests {
     async fn registration_credential_query_rejects_expired_challenge() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:query-expired";
-        let controller_did = "did:oan:AGUS:ExpiredController";
+        let resource_did = "did:oan:K7mQ9:query-expired";
+        let controller_did = "did:oan:R4tYu:ExpiredController";
         let mut request =
             controller_query_request(&state, resource_did, controller_did, "query-nonce-expired");
         write_resource_record(
@@ -2605,8 +2638,8 @@ mod tests {
     async fn registration_credential_query_rejects_controller_method_hash_mismatch() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
-        let resource_did = "did:oan:SKLG:query-method-hash-mismatch";
-        let controller_did = "did:oan:AGUS:MethodHashMismatchController";
+        let resource_did = "did:oan:K7mQ9:query-method-hash-mismatch";
+        let controller_did = "did:oan:R4tYu:MethodHashMismatchController";
         let request = controller_query_request(
             &state,
             resource_did,
@@ -2704,7 +2737,12 @@ mod tests {
             .oan_metadata
             .as_mut()
             .unwrap()
-            .controller_did = Some("did:oan:AGUS:ControllerMissingProof".to_owned());
+            .controller_did = Some("did:oan:R4tYu:ControllerMissingProof".to_owned());
+        submission.did_document.controller = Some(oan_core::DidController::Did(
+            "did:oan:R4tYu:ControllerMissingProof".to_owned(),
+        ));
+        submission.did_document.verification_method[0].controller =
+            "did:oan:R4tYu:ControllerMissingProof".to_owned();
 
         let err = register_resource(State(state), Json(submission))
             .await
@@ -2735,7 +2773,7 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:AGUS:9ControllerProofAccepted");
+        attach_external_controller_proof(&mut submission, "did:oan:R4tYu:9ControllerProofAccepted");
 
         let response = register_resource(State(state.clone()), Json(submission.clone()))
             .await
@@ -2752,7 +2790,7 @@ mod tests {
         );
         assert_eq!(
             stored["registrationCredentialAccess"]["controllerDid"],
-            "did:oan:AGUS:9ControllerProofAccepted"
+            "did:oan:R4tYu:9ControllerProofAccepted"
         );
         assert!(stored["registrationCredentialAccess"]["verifiedVerificationMethod"].is_string());
         assert!(stored["registrationCredentialAccess"]["verifiedControllerMethodHash"].is_string());
@@ -2787,7 +2825,7 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:AGUS:9ControllerReplay");
+        attach_external_controller_proof(&mut submission, "did:oan:R4tYu:9ControllerReplay");
 
         let _ = register_resource(State(state.clone()), Json(submission.clone()))
             .await
@@ -2807,7 +2845,7 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:AGUS:9ControllerProofTampered");
+        attach_external_controller_proof(&mut submission, "did:oan:R4tYu:9ControllerProofTampered");
         submission
             .controller_authorization_proof
             .as_mut()
