@@ -14,7 +14,6 @@ allowed_origins = [
 [node]
 name = "Registrar Node"
 role = "registrar"
-did_semantic_code = "AGRG"
 
 [upstream]
 root_endpoint = "http://localhost:8000"
