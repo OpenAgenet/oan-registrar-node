@@ -21,8 +21,8 @@ use oan_crypto::{
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
-    HealthResponse, RegistrationCredentialQueryRequest, ResourceRegistrationSubmission,
-    ResourceVerifyAndPublishRequest, OAN_RESOURCE_PROTOCOL_VERSION,
+    validate_resource_routing_code, HealthResponse, RegistrationCredentialQueryRequest,
+    ResourceRegistrationSubmission, ResourceVerifyAndPublishRequest, OAN_RESOURCE_PROTOCOL_VERSION,
     PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PROTOCOL_REGISTRATION_CREDENTIAL_QUERY_V1,
     PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION, PURPOSE_REGISTRATION_CREDENTIAL_QUERY,
     PURPOSE_VERIFY_AND_PUBLISH,
@@ -452,6 +452,8 @@ async fn register_resource(
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
+    validate_resource_routing_code(&submission.resource_did, &state.did)
+        .map_err(ApiError::bad_request)?;
     let verified_controller_method =
         verify_controller_authorization_for_submission(&state, &submission)
             .map_err(ApiError::bad_request)?;
@@ -1787,7 +1789,7 @@ mod tests {
     }
 
     fn sample_submission() -> ResourceRegistrationSubmission {
-        let did = "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
+        let did = "did:oan:6HkPq:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
         let document = sample_document(did);
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &document).unwrap();
@@ -2959,5 +2961,23 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn register_resource_rejects_resource_routing_code_not_owned_by_registrar() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let mut submission = sample_submission();
+        submission.resource_did =
+            "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
+        submission.did_document.id = submission.resource_did.clone();
+        submission.subject_control_proof.challenge.subject_did = submission.resource_did.clone();
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "resource_routing_code_mismatch");
     }
 }
