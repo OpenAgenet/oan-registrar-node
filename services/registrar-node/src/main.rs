@@ -2968,8 +2968,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
         let mut submission = sample_submission();
-        submission.resource_did =
-            "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
+        submission.resource_did = "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
         submission.did_document.id = submission.resource_did.clone();
         submission.subject_control_proof.challenge.subject_did = submission.resource_did.clone();
 
