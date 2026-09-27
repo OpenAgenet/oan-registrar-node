@@ -14,8 +14,12 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use futures::TryStreamExt;
-use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument};
-use oan_credentials::sign_credential;
+use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
+use oan_credentials::{
+    sign_credential, validate_resource_registration_credential, CredentialStatusReference,
+    ExternalIdentifierReference,
+    OanResourceRegistrationCredential, ResourceRegistrationCredentialSubject,
+};
 use oan_crypto::{
     hash_json_with_suite, signing_key_from_bytes, verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
@@ -276,6 +280,9 @@ async fn main() -> Result<()> {
     let config = load_config(config_path)?;
     validate_stats_report_config(&config.stats_report)?;
     let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
+    did_doc
+        .validate_infrastructure_profile(ResourceType::RegistrarNode)
+        .map_err(|error| anyhow!("invalid registrar DID document profile: {error}"))?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
     let signing_key = signing_key_from_bytes(
@@ -779,40 +786,97 @@ fn issue_resource_registration_credential(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let mut credential = json!({
-        "@context": [
-            "https://www.w3.org/2018/credentials/v1",
-            "https://openagenet.org/credentials/v1"
+    let subject_type = submission
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.subject_type.clone())
+        .ok_or_else(|| ApiError::bad_request("resource_subject_type_missing"))?;
+    let credential_id = format!(
+        "urn:oan:credential:resource-registration:{}",
+        did_to_file_name(&submission.resource_did).trim_end_matches(".json")
+    );
+    let subject = ResourceRegistrationCredentialSubject {
+        id: submission.resource_did.clone(),
+        resource_type: submission.resource_type.clone(),
+        subject_type,
+        registrar_did: state.did.clone(),
+        did_document_hash: did_document_hash.to_owned(),
+        metadata_hash: submission.metadata_hash.clone(),
+        package_hash: submission.package_hash.clone(),
+        package_version: submission.package_version.clone(),
+        hash_algorithm: submission.hash_algorithm.clone(),
+        authorized_domains,
+        external_identifiers: external_identifiers
+            .into_iter()
+            .filter_map(|value| {
+                value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| ExternalIdentifierReference { id: id.to_owned() })
+            })
+            .collect(),
+        lifecycle_state: submission.metadata["lifecycleState"]
+            .as_str()
+            .unwrap_or("active")
+            .to_owned(),
+    };
+    let mut credential = OanResourceRegistrationCredential {
+        context: vec![
+            "https://www.w3.org/2018/credentials/v1".to_owned(),
+            "https://openagenet.org/credentials/v1".to_owned(),
         ],
-        "id": format!("urn:oan:credential:resource-registration:{}", did_to_file_name(&submission.resource_did).trim_end_matches(".json")),
-        "type": [
-            "VerifiableCredential",
-            "OANResourceRegistrationCredential"
+        id: Some(credential_id.clone()),
+        credential_type: vec![
+            "VerifiableCredential".to_owned(),
+            "OANResourceRegistrationCredential".to_owned(),
         ],
-        "issuer": state.did,
-        "issuanceDate": issued_at,
-        "credentialSubject": {
-            "id": submission.resource_did,
-            "resourceDid": submission.resource_did,
-            "resourceType": submission.resource_type,
-            "didDocumentHash": did_document_hash,
-            "metadataHash": submission.metadata_hash,
-            "packageHash": submission.package_hash,
-            "packageVersion": submission.package_version,
-            "hashAlgorithm": submission.hash_algorithm,
-            "authorizedDomains": authorized_domains,
-            "externalIdentifiers": external_identifiers,
-            "lifecycleState": submission.metadata["lifecycleState"].as_str().unwrap_or("active")
-        },
-        "credentialStatus": {
-            "type": "OANResourceRegistrationStatus",
-            "status": "active"
-        }
-    });
-    let proof = sign_credential(&credential, key_id.clone(), key_id, &state.signing_key)
-        .map_err(ApiError::internal)?;
-    credential["proof"] = serde_json::to_value(proof).map_err(ApiError::internal)?;
-    Ok(credential)
+        issuer: state.did.clone(),
+        issuance_date: issued_at,
+        expiration_date: None,
+        credential_subject: subject,
+        credential_status: Some(CredentialStatusReference {
+            id: format!(
+                "{}/resources/{}/status",
+                state.did,
+                did_to_file_name(&submission.resource_did)
+            ),
+            status_type: "OANResourceRegistrationStatus2026".to_owned(),
+            credential_id: Some(credential_id),
+            subject_did: Some(submission.resource_did.clone()),
+            issuer_did: Some(state.did.clone()),
+            status: Some("active".to_owned()),
+            sequence: None,
+            event_digest: None,
+            updated_at: Some(issued_at),
+            package_id: None,
+            bulletin_object_id: None,
+            expected_governance_state: None,
+            latest_action: None,
+            did_document_stable_hash: Some(did_document_hash.to_owned()),
+            policy_hash: None,
+            effective_from_ms: None,
+            expires_at_ms: None,
+            extra: Default::default(),
+        }),
+        credential_schema: None,
+        proof: sign_credential(&json!({}), key_id.clone(), key_id, &state.signing_key)
+            .map_err(ApiError::internal)?,
+    };
+    let mut unsigned = serde_json::to_value(&credential).map_err(ApiError::internal)?;
+    unsigned
+        .as_object_mut()
+        .expect("credential serializes as object")
+        .remove("proof");
+    credential.proof = sign_credential(
+        &unsigned,
+        format!("{}#key-1", state.did),
+        format!("{}#key-1", state.did),
+        &state.signing_key,
+    )
+    .map_err(ApiError::internal)?;
+    validate_resource_registration_credential(&credential).map_err(ApiError::internal)?;
+    serde_json::to_value(credential).map_err(ApiError::internal)
 }
 
 async fn write_resource_record(
@@ -2709,7 +2773,7 @@ mod tests {
             state.did.clone()
         );
         assert_eq!(
-            response.0["registrationCredential"]["credentialSubject"]["resourceDid"],
+            response.0["registrationCredential"]["credentialSubject"]["id"],
             submission.resource_did
         );
         assert_eq!(
