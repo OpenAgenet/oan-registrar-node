@@ -3043,4 +3043,27 @@ mod tests {
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "resource_routing_code_mismatch");
     }
+
+    #[tokio::test]
+    async fn register_resource_rejects_did_document_resource_type_mismatch() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let mut submission = sample_submission();
+        submission
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .resource_type = ResourceType::McpServer;
+
+        let err = register_resource(State(state), Json(submission))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message,
+            "subject type and resource type combination is invalid"
+        );
+    }
 }
