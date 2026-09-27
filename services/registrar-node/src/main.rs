@@ -17,8 +17,8 @@ use futures::TryStreamExt;
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
 use oan_credentials::{
     sign_credential, validate_resource_registration_credential, CredentialStatusReference,
-    ExternalIdentifierReference,
-    OanResourceRegistrationCredential, ResourceRegistrationCredentialSubject,
+    ExternalIdentifierReference, OanResourceRegistrationCredential,
+    ResourceRegistrationCredentialSubject,
 };
 use oan_crypto::{
     hash_json_with_suite, signing_key_from_bytes, verify_payload_with_proof,
