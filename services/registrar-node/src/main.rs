@@ -21,7 +21,9 @@ use oan_credentials::{
     ResourceRegistrationCredentialSubject,
 };
 use oan_crypto::{
-    hash_json_with_suite, signing_key_from_bytes, verify_payload_with_proof,
+    did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
+    signing_key_from_bytes, verify_did_document_proof,
+    verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
@@ -285,6 +287,8 @@ async fn main() -> Result<()> {
     did_doc
         .validate_infrastructure_profile(ResourceType::RegistrarNode)
         .map_err(|error| anyhow!("invalid registrar DID document profile: {error}"))?;
+    verify_did_document_proof(&did_doc)
+        .map_err(|error| anyhow!("invalid registrar DID document proof: {error}"))?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
     let signing_key = signing_key_from_bytes(
@@ -1810,8 +1814,12 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: key.verifying_key(),
         };
-        DidDocument {
-            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+        let mut document = DidDocument {
+            context: vec![
+                "https://www.w3.org/ns/did/v1".to_owned(),
+                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
             id: did.to_owned(),
             controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
@@ -1821,7 +1829,7 @@ mod tests {
                 crypto_suite: Some(CryptoSuite::Ed25519Sha256),
                 public_key_format: Some("multibase".to_owned()),
                 public_key_multibase: Some(public_key_multibase(&verifying_key)),
-                public_key_jwk: None,
+                public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
             authentication: vec![format!("{did}#key-1")],
             assertion_method: vec![format!("{did}#key-1")],
@@ -1835,16 +1843,7 @@ mod tests {
                 server_type: None,
                 port: None,
             }],
-            proof: Some(oan_core::DataIntegrityProof {
-                proof_type: "Ed25519Signature2020".to_owned(),
-                creator: format!("{did}#key-1"),
-                created: Utc::now(),
-                proof_purpose: "assertionMethod".to_owned(),
-                proof_value: "fixture".to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                hash_algorithm: Some("sha256".to_owned()),
-                verification_method: Some(format!("{did}#key-1")),
-            }),
+            proof: None,
             oan_metadata: Some(OanMetadata {
                 subject_type: SubjectType::Skill,
                 resource_type: ResourceType::Skill,
@@ -1880,7 +1879,26 @@ mod tests {
                 lifecycle_state: Some("active".to_owned()),
                 extra: Default::default(),
             }),
-        }
+        };
+        let input = did_document_signature_input(&document, CryptoSuite::Ed25519Sha256).unwrap();
+        document.proof = Some(oan_core::DataIntegrityProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: String::new(),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: sign_bytes_multibase(
+                &oan_crypto::SigningKey::Ed25519 {
+                    suite: CryptoSuite::Ed25519Sha256,
+                    key,
+                },
+                &input,
+            )
+            .unwrap(),
+            crypto_suite: None,
+            hash_algorithm: None,
+            verification_method: Some(format!("{did}#key-1")),
+        });
+        document
     }
 
     fn sample_submission() -> ResourceRegistrationSubmission {
@@ -3082,6 +3100,33 @@ mod tests {
         submission.resource_did = "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
         submission.did_document.id = submission.resource_did.clone();
         submission.subject_control_proof.challenge.subject_did = submission.resource_did.clone();
+        let key = generate_ed25519_keypair();
+        let method_id = format!("{}#key-1", submission.resource_did);
+        submission.did_document.verification_method[0].id = method_id.clone();
+        submission.did_document.authentication = vec![method_id.clone()];
+        submission.did_document.assertion_method = vec![method_id.clone()];
+        submission.did_document.capability_invocation = vec![method_id.clone()];
+        submission.did_document.proof = None;
+        let input =
+            did_document_signature_input(&submission.did_document, CryptoSuite::Ed25519Sha256)
+                .unwrap();
+        submission.did_document.proof = Some(oan_core::DataIntegrityProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: String::new(),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: sign_bytes_multibase(
+                &SigningKey::Ed25519 {
+                    suite: CryptoSuite::Ed25519Sha256,
+                    key,
+                },
+                &input,
+            )
+            .unwrap(),
+            crypto_suite: None,
+            hash_algorithm: None,
+            verification_method: Some(method_id),
+        });
 
         let err = register_resource(State(state), Json(submission))
             .await
