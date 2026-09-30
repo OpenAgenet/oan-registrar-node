@@ -325,6 +325,7 @@ async fn main() -> Result<()> {
         .route("/registrar/root-authorization", get(api_root_authorization))
         .route("/resources", get(api_resources))
         .route("/resources/{did}", get(api_resource_detail))
+        .route("/resources/{did}/status", get(api_registration_credential_status))
         .route(
             "/resources/{did}/registration-credential",
             post(api_registration_credential),
@@ -1374,6 +1375,37 @@ async fn api_resource_detail(
     Ok(Json(json!({
         "resourceDid": did,
         "record": public_resource_record_projection(&record)
+    })))
+}
+
+async fn api_registration_credential_status(
+    State(state): State<AppState>,
+    AxumPath(did): AxumPath<String>,
+) -> ApiResult<Value> {
+    let record = read_resource_record(&state, &did)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some(record) = record else {
+        return Ok(Json(json!({
+            "issuerDid": state.did,
+            "credentialId": format!("urn:oan:credential:resource-registration:{}", did_to_file_name(&did).trim_end_matches(".json")),
+            "subjectDid": did,
+            "status": "unknown",
+            "reason": "not_found",
+            "observedAt": Utc::now(),
+        })));
+    };
+    let status = record
+        .get("rootResponse")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("active");
+    Ok(Json(json!({
+        "issuerDid": state.did,
+        "credentialId": record.pointer("/registrationCredential/id"),
+        "subjectDid": did,
+        "status": status,
+        "observedAt": record.get("submittedAt").cloned().unwrap_or_else(|| json!(Utc::now())),
     })))
 }
 
