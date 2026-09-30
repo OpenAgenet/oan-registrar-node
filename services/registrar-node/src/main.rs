@@ -822,10 +822,11 @@ fn issue_resource_registration_credential(
             .to_owned(),
     };
     let mut credential = OanResourceRegistrationCredential {
-        context: vec![
-            "https://www.w3.org/2018/credentials/v1".to_owned(),
-            "https://openagenet.org/credentials/v1".to_owned(),
-        ],
+            context: vec![
+                "https://www.w3.org/2018/credentials/v1".to_owned(),
+                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
         id: Some(credential_id.clone()),
         credential_type: vec![
             "VerifiableCredential".to_owned(),
@@ -846,17 +847,7 @@ fn issue_resource_registration_credential(
             subject_did: Some(submission.resource_did.clone()),
             issuer_did: Some(state.did.clone()),
             status: Some("active".to_owned()),
-            sequence: None,
-            event_digest: None,
             updated_at: Some(issued_at),
-            package_id: None,
-            bulletin_object_id: None,
-            expected_governance_state: None,
-            latest_action: None,
-            did_document_stable_hash: Some(did_document_hash.to_owned()),
-            policy_hash: None,
-            effective_from_ms: None,
-            expires_at_ms: None,
             extra: Default::default(),
         }),
         credential_schema: None,
@@ -2781,6 +2772,22 @@ mod tests {
             json!(["legal"])
         );
         assert!(response.0["registrationCredential"]["proof"]["proofValue"].is_string());
+        assert_eq!(
+            response.0["registrationCredential"]["proof"]["type"],
+            "Ed25519Signature2020"
+        );
+        assert_eq!(
+            response.0["registrationCredential"]["proof"]["verificationMethod"],
+            format!("{}#key-1", state.did)
+        );
+        assert!(response.0["registrationCredential"]["proof"].get("creator").is_none());
+        assert!(response.0["registrationCredential"]["proof"].get("cryptoSuite").is_none());
+        assert!(response.0["registrationCredential"]["proof"].get("hashAlgorithm").is_none());
+        assert!(
+            response.0["registrationCredential"]["proof"]["proofValue"]
+                .as_str()
+                .is_some_and(|value| value.starts_with('z'))
+        );
         let stored = read_resource_record(&state, &submission.resource_did)
             .await
             .unwrap()
