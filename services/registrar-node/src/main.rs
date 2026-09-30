@@ -473,6 +473,8 @@ async fn register_resource(
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
+    verify_did_document_proof(&submission.did_document)
+        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
     let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
     let response = state
         .client
@@ -585,6 +587,8 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
+    verify_did_document_proof(&bundle.controller_did_document)
+        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method = verify_controller_authorization_proof(
         bundle,
@@ -1952,6 +1956,7 @@ mod tests {
         submission: &mut ResourceRegistrationSubmission,
         controller_did: &str,
     ) {
+        let resource_key = generate_ed25519_keypair();
         let controller_key = generate_ed25519_keypair();
         let controller_method = format!("{controller_did}#key-1");
         let verifying_key = VerifyingKey::Ed25519 {
@@ -1959,7 +1964,11 @@ mod tests {
             key: controller_key.verifying_key(),
         };
         let controller_document = DidDocument {
-            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            context: vec![
+                "https://www.w3.org/ns/did/v1".to_owned(),
+                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
             id: controller_did.to_owned(),
             controller: Some(oan_core::DidController::Did(controller_did.to_owned())),
             verification_method: vec![VerificationMethod {
@@ -1978,14 +1987,72 @@ mod tests {
             proof: None,
             oan_metadata: None,
         };
+        let controller_input =
+            did_document_signature_input(&controller_document, CryptoSuite::Ed25519Sha256)
+                .unwrap();
+        let controller_document = DidDocument {
+            proof: Some(oan_core::DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: String::new(),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: sign_bytes_multibase(
+                    &SigningKey::Ed25519 {
+                        suite: CryptoSuite::Ed25519Sha256,
+                        key: controller_key.clone(),
+                    },
+                    &controller_input,
+                )
+                .unwrap(),
+                crypto_suite: None,
+                hash_algorithm: None,
+                verification_method: Some(controller_method.clone()),
+            }),
+            ..controller_document
+        };
         let metadata = submission.did_document.oan_metadata.as_mut().unwrap();
         submission.did_document.controller =
             Some(oan_core::DidController::Did(controller_did.to_owned()));
-        if let Some(method) = submission.did_document.verification_method.first_mut() {
-            method.controller = controller_did.to_owned();
-        }
         metadata.controller_did = Some(controller_did.to_owned());
         metadata.publisher_did = Some(controller_did.to_owned());
+        let resource_method = format!("{}#key-1", submission.resource_did);
+        let resource_verifying_key = VerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: resource_key.verifying_key(),
+        };
+        let method = submission
+            .did_document
+            .verification_method
+            .first_mut()
+            .unwrap();
+        method.id = resource_method.clone();
+        method.controller = submission.resource_did.clone();
+        method.public_key_multibase = Some(public_key_multibase(&resource_verifying_key));
+        method.public_key_jwk = Some(public_key_jwk(&resource_verifying_key));
+        submission.did_document.authentication = vec![resource_method.clone()];
+        submission.did_document.assertion_method = vec![resource_method.clone()];
+        submission.did_document.capability_invocation = vec![resource_method.clone()];
+        submission.did_document.proof = None;
+        let resource_input =
+            did_document_signature_input(&submission.did_document, CryptoSuite::Ed25519Sha256)
+                .unwrap();
+        submission.did_document.proof = Some(oan_core::DataIntegrityProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: String::new(),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: sign_bytes_multibase(
+                &SigningKey::Ed25519 {
+                    suite: CryptoSuite::Ed25519Sha256,
+                    key: resource_key,
+                },
+                &resource_input,
+            )
+            .unwrap(),
+            crypto_suite: None,
+            hash_algorithm: None,
+            verification_method: Some(resource_method),
+        });
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &submission.did_document).unwrap();
         submission.did_document_hash = format!("sha256:{did_document_hash}");
@@ -2122,6 +2189,50 @@ mod tests {
             .as_mut()
             .unwrap()
             .authorized_domains = domains;
+        let key = generate_ed25519_keypair();
+        let verifying_key = VerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.verifying_key(),
+        };
+        let method_id = format!("{}#key-1", submission.resource_did);
+        let method = submission
+            .did_document
+            .verification_method
+            .first_mut()
+            .unwrap();
+        method.id = method_id.clone();
+        method.controller = submission.resource_did.clone();
+        method.public_key_multibase = Some(public_key_multibase(&verifying_key));
+        method.public_key_jwk = Some(public_key_jwk(&verifying_key));
+        submission.did_document.authentication = vec![method_id.clone()];
+        submission.did_document.assertion_method = vec![method_id.clone()];
+        submission.did_document.capability_invocation = vec![method_id.clone()];
+        submission.did_document.proof = None;
+        let input =
+            did_document_signature_input(&submission.did_document, CryptoSuite::Ed25519Sha256)
+                .unwrap();
+        submission.did_document.proof = Some(oan_core::DataIntegrityProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: String::new(),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: sign_bytes_multibase(
+                &SigningKey::Ed25519 {
+                    suite: CryptoSuite::Ed25519Sha256,
+                    key,
+                },
+                &input,
+            )
+            .unwrap(),
+            crypto_suite: None,
+            hash_algorithm: None,
+            verification_method: Some(method_id),
+        });
+        let hash =
+            hash_json_with_suite(CryptoSuite::Ed25519Sha256, &submission.did_document).unwrap();
+        submission.did_document_hash = format!("sha256:{hash}");
+        submission.subject_control_proof.challenge.did_document_hash =
+            submission.did_document_hash.clone();
     }
 
     #[test]
