@@ -270,8 +270,6 @@ async fn main() -> Result<()> {
     did_doc
         .validate_infrastructure_profile(ResourceType::RegistrarNode)
         .map_err(|error| anyhow!("invalid registrar DID document profile: {error}"))?;
-    verify_did_document_proof(&did_doc)
-        .map_err(|error| anyhow!("invalid registrar DID document proof: {error}"))?;
     let signing_key =
         signing_key_from_private_key_jwk(CryptoSuite::Ed25519Sha256, &identity.private_key_jwk)?;
     // Public projection used by existing registration paths; identity.json remains authoritative.
