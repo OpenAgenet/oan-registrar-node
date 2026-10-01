@@ -21,8 +21,7 @@ use oan_credentials::{
 };
 use oan_crypto::{
     did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
-    signing_key_from_private_key_jwk, verify_did_document_proof,
-    verify_payload_with_proof,
+    signing_key_from_private_key_jwk, verify_did_document_proof, verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
@@ -264,7 +263,8 @@ async fn main() -> Result<()> {
     validate_stats_report_config(&config.stats_report)?;
     let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
     identity
-        .validate()
+        .validate_data_integrity()
+        .await
         .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
     let did_doc: DidDocument = identity.did_document.clone();
     did_doc
@@ -272,10 +272,8 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow!("invalid registrar DID document profile: {error}"))?;
     verify_did_document_proof(&did_doc)
         .map_err(|error| anyhow!("invalid registrar DID document proof: {error}"))?;
-    let signing_key = signing_key_from_private_key_jwk(
-        CryptoSuite::Ed25519Sha256,
-        &identity.private_key_jwk,
-    )?;
+    let signing_key =
+        signing_key_from_private_key_jwk(CryptoSuite::Ed25519Sha256, &identity.private_key_jwk)?;
     // Public projection used by existing registration paths; identity.json remains authoritative.
     JsonStore::new(&config.paths.data_dir).write("did-document.json", &did_doc)?;
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
@@ -314,7 +312,10 @@ async fn main() -> Result<()> {
         .route("/registrar/root-authorization", get(api_root_authorization))
         .route("/resources", get(api_resources))
         .route("/resources/{did}", get(api_resource_detail))
-        .route("/resources/{did}/status", get(api_registration_credential_status))
+        .route(
+            "/resources/{did}/status",
+            get(api_registration_credential_status),
+        )
         .route(
             "/resources/{did}/registration-credential",
             post(api_registration_credential),
@@ -816,11 +817,11 @@ fn issue_resource_registration_credential(
             .to_owned(),
     };
     let mut credential = OanResourceRegistrationCredential {
-            context: vec![
-                "https://www.w3.org/2018/credentials/v1".to_owned(),
-                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
-                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
-            ],
+        context: vec![
+            "https://www.w3.org/2018/credentials/v1".to_owned(),
+            "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+            "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+        ],
         id: Some(credential_id.clone()),
         credential_type: vec![
             "VerifiableCredential".to_owned(),
@@ -1971,8 +1972,7 @@ mod tests {
             oan_metadata: None,
         };
         let controller_input =
-            did_document_signature_input(&controller_document, CryptoSuite::Ed25519Sha256)
-                .unwrap();
+            did_document_signature_input(&controller_document, CryptoSuite::Ed25519Sha256).unwrap();
         let controller_document = DidDocument {
             proof: Some(oan_core::DataIntegrityProof {
                 proof_type: "Ed25519Signature2020".to_owned(),
@@ -2932,14 +2932,18 @@ mod tests {
             response.0["registrationCredential"]["proof"]["verificationMethod"],
             format!("{}#key-1", state.did)
         );
-        assert!(response.0["registrationCredential"]["proof"].get("creator").is_none());
-        assert!(response.0["registrationCredential"]["proof"].get("cryptoSuite").is_none());
-        assert!(response.0["registrationCredential"]["proof"].get("hashAlgorithm").is_none());
-        assert!(
-            response.0["registrationCredential"]["proof"]["proofValue"]
-                .as_str()
-                .is_some_and(|value| value.starts_with('z'))
-        );
+        assert!(response.0["registrationCredential"]["proof"]
+            .get("creator")
+            .is_none());
+        assert!(response.0["registrationCredential"]["proof"]
+            .get("cryptoSuite")
+            .is_none());
+        assert!(response.0["registrationCredential"]["proof"]
+            .get("hashAlgorithm")
+            .is_none());
+        assert!(response.0["registrationCredential"]["proof"]["proofValue"]
+            .as_str()
+            .is_some_and(|value| value.starts_with('z')));
         let stored = read_resource_record(&state, &submission.resource_did)
             .await
             .unwrap()
