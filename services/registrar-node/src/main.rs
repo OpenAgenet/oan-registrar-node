@@ -21,7 +21,9 @@ use oan_credentials::{
 };
 use oan_crypto::{
     did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
-    signing_key_from_private_key_jwk, verify_did_document_proof, verify_payload_with_proof,
+    signing_key_from_private_key_jwk, verify_did_document_proof_standard_blocking,
+    verify_did_document_proof_standard_value_blocking,
+    verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
@@ -303,8 +305,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/registrar/did", get(registrar_did_document))
-        .route("/resources/register", post(register_resource))
-        .route("/resources/submit", post(register_resource))
+        .route("/resources/register", post(register_resource_raw))
+        .route("/resources/submit", post(register_resource_raw))
         .route("/registrar/status", get(api_status))
         .route("/registrar/stats", get(api_stats))
         .route("/registrar/root-authorization", get(api_root_authorization))
@@ -447,6 +449,30 @@ async fn register_resource(
     State(state): State<AppState>,
     Json(submission): Json<ResourceRegistrationSubmission>,
 ) -> ApiResult<Value> {
+    let did_document = serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
+    register_resource_with_raw_document(state, submission, did_document).await
+}
+
+async fn register_resource_raw(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> ApiResult<Value> {
+    let did_document = payload
+        .get("didDocument")
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
+    verify_did_document_proof_standard_value_blocking(did_document.clone())
+        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
+    let submission: ResourceRegistrationSubmission =
+        serde_json::from_value(payload).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    register_resource_with_raw_document(state, submission, did_document).await
+}
+
+async fn register_resource_with_raw_document(
+    state: AppState,
+    submission: ResourceRegistrationSubmission,
+    raw_did_document: Value,
+) -> ApiResult<Value> {
     submission.validate_shape().map_err(ApiError::bad_request)?;
     validate_resource_routing_code(&submission.resource_did, &state.did)
         .map_err(ApiError::bad_request)?;
@@ -455,9 +481,10 @@ async fn register_resource(
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
-    verify_did_document_proof(&submission.did_document)
+    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
         .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
-    let request = build_resource_verify_and_publish_request(&state, submission.clone())?;
+    let request =
+        build_resource_verify_and_publish_request_with_raw(&state, submission.clone(), raw_did_document.clone())?;
     let response = state
         .client
         .post(format!(
@@ -569,7 +596,7 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    verify_did_document_proof(&bundle.controller_did_document)
+    verify_did_document_proof_standard_blocking(&bundle.controller_did_document)
         .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method = verify_controller_authorization_proof(
@@ -615,6 +642,7 @@ fn verify_controller_authorization_for_submission(
     })?;
     Ok(Some(verification_method))
 }
+
 
 fn validate_resource_authorized_domains_for_registrar(
     state: &AppState,
@@ -731,6 +759,15 @@ fn build_resource_verify_and_publish_request(
     state: &AppState,
     submission: ResourceRegistrationSubmission,
 ) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
+    let raw_did_document = serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
+    build_resource_verify_and_publish_request_with_raw(state, submission, raw_did_document)
+}
+
+fn build_resource_verify_and_publish_request_with_raw(
+    state: &AppState,
+    submission: ResourceRegistrationSubmission,
+    raw_did_document: Value,
+) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
     let mut root_submission = submission;
     root_submission.registration_credential = Value::Null;
     let envelope = create_signed_request_envelope(SignedRequestEnvelopeInput {
@@ -750,6 +787,7 @@ fn build_resource_verify_and_publish_request(
     Ok(ResourceVerifyAndPublishRequest {
         registrar_did: state.did.clone(),
         submission: root_submission,
+        did_document_raw: Some(raw_did_document),
         upstream_auth: envelope,
     })
 }
