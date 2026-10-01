@@ -11,18 +11,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use futures::TryStreamExt;
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
 use oan_credentials::{
     sign_credential, validate_resource_registration_credential, CredentialStatusReference,
-    ExternalIdentifierReference, OanResourceRegistrationCredential,
+    ExternalIdentifierReference, OanIdentity, OanResourceRegistrationCredential,
     ResourceRegistrationCredentialSubject,
 };
 use oan_crypto::{
     did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
-    signing_key_from_bytes, verify_did_document_proof,
+    signing_key_from_private_key_jwk, verify_did_document_proof,
     verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
@@ -133,8 +132,8 @@ struct PathConfig {
     data_dir: PathBuf,
     #[serde(default = "default_records_dir")]
     records_dir: PathBuf,
-    #[serde(default = "default_keys_dir")]
-    keys_dir: PathBuf,
+    #[serde(default = "default_identity_file")]
+    identity_file: PathBuf,
     #[serde(default = "default_controller_authorization_nonce_file")]
     controller_authorization_nonce_file: PathBuf,
     #[serde(default = "default_registration_credential_query_nonce_file")]
@@ -147,8 +146,8 @@ fn default_records_dir() -> PathBuf {
     PathBuf::from("../../data/registrar/resource-records")
 }
 
-fn default_keys_dir() -> PathBuf {
-    PathBuf::from("../../data/registrar/keys")
+fn default_identity_file() -> PathBuf {
+    PathBuf::from("../../data/registrar/identity.json")
 }
 
 fn default_controller_authorization_nonce_file() -> PathBuf {
@@ -191,18 +190,6 @@ const REGISTRAR_MAX_PAGE_SIZE: u32 = 500;
 const REGISTRAR_MAX_RECORD_BYTES: usize = 1024 * 1024;
 const REGISTRAR_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
-struct DevKeyFile {
-    algorithm: String,
-    #[serde(rename = "privateKeyJwk")]
-    private_key_jwk: PrivateKeyJwk,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PrivateKeyJwk {
-    d: String,
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -212,14 +199,6 @@ struct ErrorBody {
 struct ApiError {
     status: StatusCode,
     message: String,
-}
-
-fn crypto_suite_from_algorithm(value: &str) -> Result<CryptoSuite> {
-    match value {
-        "Ed25519" => Ok(CryptoSuite::Ed25519Sha256),
-        "SM2" => Ok(CryptoSuite::Sm2Sm3),
-        other => Err(anyhow::anyhow!("unsupported_algorithm: {other}")),
-    }
 }
 
 impl ApiError {
@@ -283,18 +262,22 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "services/registrar-node/config.example.toml".to_owned());
     let config = load_config(config_path)?;
     validate_stats_report_config(&config.stats_report)?;
-    let did_doc: DidDocument = JsonStore::new(&config.paths.data_dir).read("did-document.json")?;
+    let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
+    identity
+        .validate()
+        .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
+    let did_doc: DidDocument = identity.did_document.clone();
     did_doc
         .validate_infrastructure_profile(ResourceType::RegistrarNode)
         .map_err(|error| anyhow!("invalid registrar DID document profile: {error}"))?;
     verify_did_document_proof(&did_doc)
         .map_err(|error| anyhow!("invalid registrar DID document proof: {error}"))?;
-    let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
-    let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
-    let signing_key = signing_key_from_bytes(
-        crypto_suite,
-        &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
+    let signing_key = signing_key_from_private_key_jwk(
+        CryptoSuite::Ed25519Sha256,
+        &identity.private_key_jwk,
     )?;
+    // Public projection used by existing registration paths; identity.json remains authoritative.
+    JsonStore::new(&config.paths.data_dir).write("did-document.json", &did_doc)?;
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
         Some(url) if !url.is_empty() => {
             let database = DatabaseConfig::parse(url)?;
@@ -314,7 +297,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         data: JsonStore::new(&config.paths.data_dir),
         config: config.clone(),
-        did: did_doc.id,
+        did: identity.did,
         signing_key,
         sqlite,
         postgres,
@@ -370,7 +353,7 @@ fn load_config(path: String) -> Result<Config> {
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
     config.paths.records_dir = resolve_relative(base, &config.paths.records_dir);
-    config.paths.keys_dir = resolve_relative(base, &config.paths.keys_dir);
+    config.paths.identity_file = resolve_relative(base, &config.paths.identity_file);
     config.paths.controller_authorization_nonce_file =
         resolve_relative(base, &config.paths.controller_authorization_nonce_file);
     config.paths.registration_credential_query_nonce_file =
@@ -1792,7 +1775,7 @@ mod tests {
                 paths: PathConfig {
                     data_dir: dir.to_path_buf(),
                     records_dir: dir.join("records"),
-                    keys_dir: dir.join("keys"),
+                    identity_file: dir.join("identity.json"),
                     controller_authorization_nonce_file: dir
                         .join("controller-authorization-nonces.json"),
                     registration_credential_query_nonce_file: dir
