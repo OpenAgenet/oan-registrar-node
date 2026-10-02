@@ -20,7 +20,7 @@ use oan_credentials::{
     ResourceRegistrationCredentialSubject,
 };
 #[cfg(test)]
-use oan_crypto::{did_document_signature_input, public_key_jwk, sign_bytes_multibase};
+use oan_crypto::public_key_jwk;
 use oan_crypto::{
     hash_json_with_suite, signing_key_from_private_key_jwk, verify_did_document_proof,
     verify_did_document_proof_standard_value_blocking, verify_payload_with_proof,
@@ -1813,7 +1813,10 @@ mod tests {
         OanMetadata, ProtocolBinding, ResourceDescription, ResourceType, ServiceEndpoint,
         SubjectType, VerificationMethod,
     };
-    use oan_crypto::{generate_ed25519_keypair, public_key_multibase, VerifyingKey};
+    use oan_crypto::{
+        generate_ed25519_keypair, private_key_jwk, public_key_multibase, sign_oan_data_integrity,
+        VerifyingKey,
+    };
     use oan_protocol::{
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
         RegistrationCredentialQueryChallenge, SubjectControlProofBundle,
@@ -1865,26 +1868,28 @@ mod tests {
 
     fn sign_test_did_document(document: &mut DidDocument, key: ed25519_dalek::SigningKey) {
         document.proof = None;
-        let method_id = format!("{}#key-1", document.id);
-        let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
-        document.proof = Some(oan_core::DataIntegrityProof {
-            context: None,
-            proof_type: "Ed25519Signature2020".to_owned(),
-            creator: method_id.clone(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: sign_bytes_multibase(
-                &SigningKey::Ed25519 {
-                    suite: CryptoSuite::Ed25519Sha256,
-                    key,
-                },
-                &input,
-            )
-            .unwrap(),
-            crypto_suite: None,
-            hash_algorithm: None,
-            verification_method: Some(method_id),
-        });
+        let did = document.id.clone();
+        let signing_key = SigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key,
+        };
+        let private_jwk = private_key_jwk(&signing_key);
+        let unsigned = document.clone();
+        let signed = std::thread::Builder::new()
+            .name("registrar-test-did-signer".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                futures::executor::block_on(sign_oan_data_integrity(
+                    serde_json::to_value(&unsigned).unwrap(),
+                    &did,
+                    private_jwk,
+                ))
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        *document = serde_json::from_value(signed).unwrap();
     }
 
     fn sample_document(did: &str) -> DidDocument {
