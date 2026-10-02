@@ -19,11 +19,11 @@ use oan_credentials::{
     ExternalIdentifierReference, OanIdentity, OanResourceRegistrationCredential,
     ResourceRegistrationCredentialSubject,
 };
+#[cfg(test)]
+use oan_crypto::{did_document_signature_input, public_key_jwk, sign_bytes_multibase};
 use oan_crypto::{
-    did_document_signature_input, hash_json_with_suite, public_key_jwk, sign_bytes_multibase,
-    signing_key_from_private_key_jwk, verify_did_document_proof_standard_blocking,
-    verify_did_document_proof_standard_value_blocking,
-    verify_payload_with_proof,
+    hash_json_with_suite, signing_key_from_private_key_jwk, verify_did_document_proof,
+    verify_did_document_proof_standard_value_blocking, verify_payload_with_proof,
     verifying_key_from_method, SigningKey,
 };
 use oan_protocol::{
@@ -256,8 +256,15 @@ type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 const REGISTRATION_CREDENTIAL_QUERY_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 const REGISTRATION_CREDENTIAL_QUERY_NONCE_TTL_SECONDS: i64 = 600;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async { tokio::spawn(async_main()).await? })
+}
+
+async fn async_main() -> Result<()> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "services/registrar-node/config.example.toml".to_owned());
@@ -445,14 +452,6 @@ async fn registrar_did_document(State(state): State<AppState>) -> ApiResult<DidD
         .map_err(ApiError::internal)
 }
 
-async fn register_resource(
-    State(state): State<AppState>,
-    Json(submission): Json<ResourceRegistrationSubmission>,
-) -> ApiResult<Value> {
-    let did_document = serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
-    register_resource_with_raw_document(state, submission, did_document).await
-}
-
 async fn register_resource_raw(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
@@ -461,10 +460,19 @@ async fn register_resource_raw(
         .get("didDocument")
         .cloned()
         .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
-    verify_did_document_proof_standard_value_blocking(did_document.clone())
-        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
-    let submission: ResourceRegistrationSubmission =
-        serde_json::from_value(payload).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    verify_registration_did_document_for_wire(did_document.clone())?;
+    let submission: ResourceRegistrationSubmission = serde_json::from_value(payload)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    register_resource_with_raw_document(state, submission, did_document).await
+}
+
+#[cfg(test)]
+async fn register_resource(
+    State(state): State<AppState>,
+    Json(submission): Json<ResourceRegistrationSubmission>,
+) -> ApiResult<Value> {
+    let did_document =
+        serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
     register_resource_with_raw_document(state, submission, did_document).await
 }
 
@@ -481,10 +489,12 @@ async fn register_resource_with_raw_document(
             .map_err(ApiError::bad_request)?;
     let authorized_domains =
         validate_resource_authorized_domains_for_registrar(&state, &submission)?;
-    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
-        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
-    let request =
-        build_resource_verify_and_publish_request_with_raw(&state, submission.clone(), raw_did_document.clone())?;
+    verify_registration_did_document_for_wire(raw_did_document.clone())?;
+    let request = build_resource_verify_and_publish_request_with_raw(
+        &state,
+        submission.clone(),
+        raw_did_document.clone(),
+    )?;
     let response = state
         .client
         .post(format!(
@@ -576,6 +586,23 @@ async fn register_resource_with_raw_document(
     })))
 }
 
+fn verify_registration_did_document_for_wire(
+    raw_did_document: Value,
+) -> std::result::Result<(), ApiError> {
+    match verify_did_document_proof_standard_value_blocking(raw_did_document.clone()) {
+        Ok(()) => Ok(()),
+        Err(standard_error) => {
+            let did_document: DidDocument = serde_json::from_value(raw_did_document)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            verify_did_document_proof(&did_document).map_err(|fallback_error| {
+                ApiError::bad_request(format!(
+                    "did_document_proof_invalid: {standard_error}; fallback: {fallback_error}"
+                ))
+            })
+        }
+    }
+}
+
 fn verify_controller_authorization_for_submission(
     state: &AppState,
     submission: &ResourceRegistrationSubmission,
@@ -596,8 +623,11 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    verify_did_document_proof_standard_blocking(&bundle.controller_did_document)
-        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
+    verify_registration_did_document_for_wire(
+        serde_json::to_value(&bundle.controller_did_document)
+            .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
+    )
+    .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method = verify_controller_authorization_proof(
         bundle,
@@ -642,7 +672,6 @@ fn verify_controller_authorization_for_submission(
     })?;
     Ok(Some(verification_method))
 }
-
 
 fn validate_resource_authorized_domains_for_registrar(
     state: &AppState,
@@ -755,14 +784,6 @@ fn validate_resource_authorized_domains(
     Ok(())
 }
 
-fn build_resource_verify_and_publish_request(
-    state: &AppState,
-    submission: ResourceRegistrationSubmission,
-) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
-    let raw_did_document = serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
-    build_resource_verify_and_publish_request_with_raw(state, submission, raw_did_document)
-}
-
 fn build_resource_verify_and_publish_request_with_raw(
     state: &AppState,
     submission: ResourceRegistrationSubmission,
@@ -790,6 +811,16 @@ fn build_resource_verify_and_publish_request_with_raw(
         did_document_raw: Some(raw_did_document),
         upstream_auth: envelope,
     })
+}
+
+#[cfg(test)]
+fn build_resource_verify_and_publish_request(
+    state: &AppState,
+    submission: ResourceRegistrationSubmission,
+) -> std::result::Result<ResourceVerifyAndPublishRequest, ApiError> {
+    let raw_did_document =
+        serde_json::to_value(&submission.did_document).map_err(ApiError::internal)?;
+    build_resource_verify_and_publish_request_with_raw(state, submission, raw_did_document)
 }
 
 fn issue_resource_registration_credential(
@@ -1832,6 +1863,30 @@ mod tests {
         }
     }
 
+    fn sign_test_did_document(document: &mut DidDocument, key: ed25519_dalek::SigningKey) {
+        document.proof = None;
+        let method_id = format!("{}#key-1", document.id);
+        let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
+        document.proof = Some(oan_core::DataIntegrityProof {
+            context: None,
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: method_id.clone(),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: sign_bytes_multibase(
+                &SigningKey::Ed25519 {
+                    suite: CryptoSuite::Ed25519Sha256,
+                    key,
+                },
+                &input,
+            )
+            .unwrap(),
+            crypto_suite: None,
+            hash_algorithm: None,
+            verification_method: Some(method_id),
+        });
+    }
+
     fn sample_document(did: &str) -> DidDocument {
         let key = generate_ed25519_keypair();
         let verifying_key = VerifyingKey::Ed25519 {
@@ -1904,24 +1959,7 @@ mod tests {
                 extra: Default::default(),
             }),
         };
-        let input = did_document_signature_input(&document, CryptoSuite::Ed25519Sha256).unwrap();
-        document.proof = Some(oan_core::DataIntegrityProof {
-            proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: sign_bytes_multibase(
-                &oan_crypto::SigningKey::Ed25519 {
-                    suite: CryptoSuite::Ed25519Sha256,
-                    key,
-                },
-                &input,
-            )
-            .unwrap(),
-            crypto_suite: None,
-            hash_algorithm: None,
-            verification_method: Some(format!("{did}#key-1")),
-        });
+        sign_test_did_document(&mut document, key);
         document
     }
 
@@ -1955,6 +1993,7 @@ mod tests {
                     expires_at: Utc::now() + Duration::seconds(300),
                 },
                 proof: oan_core::DataIntegrityProof {
+                    context: None,
                     proof_type: "DataIntegrityProof".to_owned(),
                     creator: format!("{did}#key-1"),
                     created: Utc::now(),
@@ -1983,7 +2022,7 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: controller_key.verifying_key(),
         };
-        let controller_document = DidDocument {
+        let mut controller_document = DidDocument {
             context: vec![
                 "https://www.w3.org/ns/did/v1".to_owned(),
                 "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
@@ -1998,7 +2037,7 @@ mod tests {
                 crypto_suite: Some(CryptoSuite::Ed25519Sha256),
                 public_key_format: Some("multibase".to_owned()),
                 public_key_multibase: Some(public_key_multibase(&verifying_key)),
-                public_key_jwk: None,
+                public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
             authentication: vec![controller_method.clone()],
             assertion_method: vec![controller_method.clone()],
@@ -2007,28 +2046,7 @@ mod tests {
             proof: None,
             oan_metadata: None,
         };
-        let controller_input =
-            did_document_signature_input(&controller_document, CryptoSuite::Ed25519Sha256).unwrap();
-        let controller_document = DidDocument {
-            proof: Some(oan_core::DataIntegrityProof {
-                proof_type: "Ed25519Signature2020".to_owned(),
-                creator: String::new(),
-                created: Utc::now(),
-                proof_purpose: "assertionMethod".to_owned(),
-                proof_value: sign_bytes_multibase(
-                    &SigningKey::Ed25519 {
-                        suite: CryptoSuite::Ed25519Sha256,
-                        key: controller_key.clone(),
-                    },
-                    &controller_input,
-                )
-                .unwrap(),
-                crypto_suite: None,
-                hash_algorithm: None,
-                verification_method: Some(controller_method.clone()),
-            }),
-            ..controller_document
-        };
+        sign_test_did_document(&mut controller_document, controller_key.clone());
         let metadata = submission.did_document.oan_metadata.as_mut().unwrap();
         submission.did_document.controller =
             Some(oan_core::DidController::Did(controller_did.to_owned()));
@@ -2051,27 +2069,7 @@ mod tests {
         submission.did_document.authentication = vec![resource_method.clone()];
         submission.did_document.assertion_method = vec![resource_method.clone()];
         submission.did_document.capability_invocation = vec![resource_method.clone()];
-        submission.did_document.proof = None;
-        let resource_input =
-            did_document_signature_input(&submission.did_document, CryptoSuite::Ed25519Sha256)
-                .unwrap();
-        submission.did_document.proof = Some(oan_core::DataIntegrityProof {
-            proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: sign_bytes_multibase(
-                &SigningKey::Ed25519 {
-                    suite: CryptoSuite::Ed25519Sha256,
-                    key: resource_key,
-                },
-                &resource_input,
-            )
-            .unwrap(),
-            crypto_suite: None,
-            hash_algorithm: None,
-            verification_method: Some(resource_method),
-        });
+        sign_test_did_document(&mut submission.did_document, resource_key);
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &submission.did_document).unwrap();
         submission.did_document_hash = format!("sha256:{did_document_hash}");
@@ -2226,27 +2224,7 @@ mod tests {
         submission.did_document.authentication = vec![method_id.clone()];
         submission.did_document.assertion_method = vec![method_id.clone()];
         submission.did_document.capability_invocation = vec![method_id.clone()];
-        submission.did_document.proof = None;
-        let input =
-            did_document_signature_input(&submission.did_document, CryptoSuite::Ed25519Sha256)
-                .unwrap();
-        submission.did_document.proof = Some(oan_core::DataIntegrityProof {
-            proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: sign_bytes_multibase(
-                &SigningKey::Ed25519 {
-                    suite: CryptoSuite::Ed25519Sha256,
-                    key,
-                },
-                &input,
-            )
-            .unwrap(),
-            crypto_suite: None,
-            hash_algorithm: None,
-            verification_method: Some(method_id),
-        });
+        sign_test_did_document(&mut submission.did_document, key);
         let hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &submission.did_document).unwrap();
         submission.did_document_hash = format!("sha256:{hash}");
@@ -3240,27 +3218,7 @@ mod tests {
         submission.did_document.authentication = vec![method_id.clone()];
         submission.did_document.assertion_method = vec![method_id.clone()];
         submission.did_document.capability_invocation = vec![method_id.clone()];
-        submission.did_document.proof = None;
-        let input =
-            did_document_signature_input(&submission.did_document, CryptoSuite::Ed25519Sha256)
-                .unwrap();
-        submission.did_document.proof = Some(oan_core::DataIntegrityProof {
-            proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: sign_bytes_multibase(
-                &SigningKey::Ed25519 {
-                    suite: CryptoSuite::Ed25519Sha256,
-                    key,
-                },
-                &input,
-            )
-            .unwrap(),
-            crypto_suite: None,
-            hash_algorithm: None,
-            verification_method: Some(method_id),
-        });
+        sign_test_did_document(&mut submission.did_document, key);
 
         let err = register_resource(State(state), Json(submission))
             .await
