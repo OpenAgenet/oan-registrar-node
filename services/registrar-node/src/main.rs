@@ -13,6 +13,8 @@ use axum::{
 };
 use chrono::{DateTime, Datelike, Duration, Utc};
 use futures::TryStreamExt;
+#[cfg(test)]
+use oan_core::ExternalIdentifier;
 use oan_core::{CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
 use oan_credentials::{
     sign_credential, validate_resource_registration_credential, CredentialStatusReference,
@@ -56,6 +58,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -190,6 +194,9 @@ const REGISTRAR_DEFAULT_PAGE_SIZE: u32 = 100;
 const REGISTRAR_MAX_PAGE_SIZE: u32 = 500;
 const REGISTRAR_MAX_RECORD_BYTES: usize = 1024 * 1024;
 const REGISTRAR_MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+static TEST_DID_DOCUMENT_PROOF_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 struct ErrorBody {
@@ -589,6 +596,11 @@ async fn register_resource_with_raw_document(
 fn verify_registration_did_document_for_wire(
     raw_did_document: Value,
 ) -> std::result::Result<(), ApiError> {
+    #[cfg(test)]
+    let _proof_guard = TEST_DID_DOCUMENT_PROOF_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
     match verify_did_document_proof_standard_value_blocking(raw_did_document.clone()) {
         Ok(()) => Ok(()),
         Err(standard_error) => {
@@ -1821,7 +1833,12 @@ mod tests {
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
         RegistrationCredentialQueryChallenge, SubjectControlProofBundle,
     };
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+    use tokio::sync::Mutex as TokioMutex;
+
+    static TEST_DID_SIGNING_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static TEST_REGISTER_RESOURCE_LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
 
     fn app_state(dir: &std::path::Path) -> AppState {
         let key = generate_ed25519_keypair();
@@ -1866,6 +1883,17 @@ mod tests {
         }
     }
 
+    async fn call_register_resource(
+        state: AppState,
+        submission: ResourceRegistrationSubmission,
+    ) -> ApiResult<Value> {
+        let _guard = TEST_REGISTER_RESOURCE_LOCK
+            .get_or_init(|| TokioMutex::new(()))
+            .lock()
+            .await;
+        register_resource(State(state), Json(submission)).await
+    }
+
     fn sign_test_did_document(document: &mut DidDocument, key: ed25519_dalek::SigningKey) {
         document.proof = None;
         let did = document.id.clone();
@@ -1875,6 +1903,10 @@ mod tests {
         };
         let private_jwk = private_key_jwk(&signing_key);
         let unsigned = document.clone();
+        let _guard = TEST_DID_SIGNING_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
         let signed = std::thread::Builder::new()
             .name("registrar-test-did-signer".to_owned())
             .stack_size(16 * 1024 * 1024)
@@ -1971,6 +2003,67 @@ mod tests {
     fn sample_submission() -> ResourceRegistrationSubmission {
         let did = "did:oan:6HkPq:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
         let document = sample_document(did);
+        let did_document_hash =
+            hash_json_with_suite(CryptoSuite::Ed25519Sha256, &document).unwrap();
+        ResourceRegistrationSubmission {
+            resource_did: did.to_owned(),
+            resource_type: ResourceType::Skill,
+            did_document: document,
+            did_document_hash: format!("sha256:{did_document_hash}"),
+            metadata: json!({"name": "Contract Skill", "description": "Review contracts"}),
+            package_version: "1".to_owned(),
+            package_hash: "sha256:placeholder-package".to_owned(),
+            metadata_hash: "sha256:placeholder-metadata".to_owned(),
+            hash_algorithm: "sha256".to_owned(),
+            registration_credential: json!({"status": "active"}),
+            subject_control_proof: SubjectControlProofBundle {
+                challenge: DidControlChallenge {
+                    challenge_id: "challenge-1".to_owned(),
+                    draft_id: "resource-draft-1".to_owned(),
+                    subject_did: did.to_owned(),
+                    did_document_hash: format!("sha256:{did_document_hash}"),
+                    registrar_did: "did:oan:P9aBc:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned(),
+                    purpose: "resource-registration".to_owned(),
+                    verification_method: format!("{did}#key-1"),
+                    nonce: "nonce-1".to_owned(),
+                    issued_at: Utc::now(),
+                    expires_at: Utc::now() + Duration::seconds(300),
+                },
+                proof: oan_core::DataIntegrityProof {
+                    context: None,
+                    proof_type: "DataIntegrityProof".to_owned(),
+                    creator: format!("{did}#key-1"),
+                    created: Utc::now(),
+                    proof_purpose: "assertionMethod".to_owned(),
+                    proof_value: "proof".to_owned(),
+                    crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                    hash_algorithm: Some("sha256".to_owned()),
+                    verification_method: Some(format!("{did}#key-1")),
+                },
+                verified_at: Some(Utc::now()),
+                verified_verification_method: Some(format!("{did}#key-1")),
+                proof_hash: Some("proof-hash".to_owned()),
+            },
+            controller_authorization_proof: None,
+        }
+    }
+
+    fn sample_submission_with_external_identifiers(
+        external_identifiers: Vec<ExternalIdentifier>,
+    ) -> ResourceRegistrationSubmission {
+        let did = "did:oan:6HkPq:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu";
+        let key = generate_ed25519_keypair();
+        let verifying_key = VerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.verifying_key(),
+        };
+        let mut document = sample_document(did);
+        document.proof = None;
+        document.verification_method[0].public_key_multibase =
+            Some(public_key_multibase(&verifying_key));
+        document.verification_method[0].public_key_jwk = Some(public_key_jwk(&verifying_key));
+        document.oan_metadata.as_mut().unwrap().external_identifiers = external_identifiers;
+        sign_test_did_document(&mut document, key);
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &document).unwrap();
         ResourceRegistrationSubmission {
@@ -2908,6 +3001,45 @@ mod tests {
     async fn register_resource_posts_to_root_and_records_resource() {
         async fn handler(Json(request): Json<ResourceVerifyAndPublishRequest>) -> Json<Value> {
             assert!(request.submission.registration_credential.is_null());
+            assert_eq!(
+                request
+                    .submission
+                    .did_document
+                    .oan_metadata
+                    .as_ref()
+                    .unwrap()
+                    .external_identifiers,
+                vec![
+                    ExternalIdentifier {
+                        id: "devil109/n8n-workflows".to_owned(),
+                        resolution_service_endpoint: Some(
+                            "https://huggingface.co/spaces".to_owned()
+                        ),
+                    },
+                    ExternalIdentifier {
+                        id: "6747420043".to_owned(),
+                        resolution_service_endpoint: Some("https://apps.example.org".to_owned()),
+                    },
+                ]
+            );
+            assert_eq!(
+                request
+                    .did_document_raw
+                    .as_ref()
+                    .and_then(|value| value.pointer("/oanMetadata/externalIdentifiers"))
+                    .cloned()
+                    .unwrap_or_else(|| json!(null)),
+                json!([
+                    {
+                        "id": "devil109/n8n-workflows",
+                        "resolutionServiceEndpoint": "https://huggingface.co/spaces"
+                    },
+                    {
+                        "id": "6747420043",
+                        "resolutionServiceEndpoint": "https://apps.example.org"
+                    }
+                ])
+            );
             Json(json!({
                 "status": "resource-verified-and-queued",
                 "resourceDid": request.submission.resource_did
@@ -2924,8 +3056,17 @@ mod tests {
         let mut state = app_state(dir.path());
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
-        let submission = sample_submission();
-        let response = register_resource(State(state.clone()), Json(submission.clone()))
+        let submission = sample_submission_with_external_identifiers(vec![
+            ExternalIdentifier {
+                id: "devil109/n8n-workflows".to_owned(),
+                resolution_service_endpoint: Some("https://huggingface.co/spaces".to_owned()),
+            },
+            ExternalIdentifier {
+                id: "6747420043".to_owned(),
+                resolution_service_endpoint: Some("https://apps.example.org".to_owned()),
+            },
+        ]);
+        let response = call_register_resource(state.clone(), submission.clone())
             .await
             .unwrap();
         assert_eq!(response.0["status"], "submitted");
@@ -2941,6 +3082,18 @@ mod tests {
         assert_eq!(
             response.0["registrationCredential"]["credentialSubject"]["authorizedDomains"],
             json!(["legal"])
+        );
+        assert_eq!(
+            response.0["registrationCredential"]["credentialSubject"]["externalIdentifiers"],
+            json!([
+                {"id": "devil109/n8n-workflows"},
+                {"id": "6747420043"}
+            ])
+        );
+        assert!(
+            response.0["registrationCredential"]["credentialSubject"]["externalIdentifiers"][0]
+                .get("resolutionServiceEndpoint")
+                .is_none()
         );
         assert!(response.0["registrationCredential"]["proof"]["proofValue"].is_string());
         assert_eq!(
@@ -2992,9 +3145,7 @@ mod tests {
         submission.did_document.verification_method[0].controller =
             "did:oan:R4tYu:ControllerMissingProof".to_owned();
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "controller_authorization_proof_required");
@@ -3023,7 +3174,7 @@ mod tests {
         let mut submission = sample_submission();
         attach_external_controller_proof(&mut submission, "did:oan:R4tYu:9ControllerProofAccepted");
 
-        let response = register_resource(State(state.clone()), Json(submission.clone()))
+        let response = call_register_resource(state.clone(), submission.clone())
             .await
             .unwrap();
 
@@ -3075,12 +3226,10 @@ mod tests {
         let mut submission = sample_submission();
         attach_external_controller_proof(&mut submission, "did:oan:R4tYu:9ControllerReplay");
 
-        let _ = register_resource(State(state.clone()), Json(submission.clone()))
+        let _ = call_register_resource(state.clone(), submission.clone())
             .await
             .unwrap();
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "controller_authorization_nonce_replayed");
@@ -3101,9 +3250,7 @@ mod tests {
             .proof
             .proof_value = "tampered".to_owned();
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "controller_authorization_proof_invalid");
@@ -3118,9 +3265,7 @@ mod tests {
         let mut submission = sample_submission();
         set_submission_domains(&mut submission, vec!["finance".to_owned()]);
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "unauthorized_domains");
@@ -3135,9 +3280,7 @@ mod tests {
         let mut submission = sample_submission();
         set_submission_domains(&mut submission, vec![]);
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "resource_domains_required");
@@ -3156,9 +3299,7 @@ mod tests {
             "authorizedDomains": ["finance"]
         });
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "authorized_domains_mismatch");
@@ -3186,9 +3327,7 @@ mod tests {
         let mut submission = sample_submission();
         set_submission_domains(&mut submission, vec!["finance.payments".to_owned()]);
 
-        let response = register_resource(State(state), Json(submission))
-            .await
-            .unwrap();
+        let response = call_register_resource(state, submission).await.unwrap();
 
         assert_eq!(
             response.0["registrationCredential"]["credentialSubject"]["authorizedDomains"],
@@ -3203,9 +3342,7 @@ mod tests {
         let mut submission = sample_submission();
         submission.resource_did = "did:ans:SKLG:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
         submission.did_document.id = submission.resource_did.clone();
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
@@ -3225,9 +3362,7 @@ mod tests {
         submission.did_document.capability_invocation = vec![method_id.clone()];
         sign_test_did_document(&mut submission.did_document, key);
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "resource_routing_code_mismatch");
@@ -3245,9 +3380,7 @@ mod tests {
             .unwrap()
             .resource_type = ResourceType::McpServer;
 
-        let err = register_resource(State(state), Json(submission))
-            .await
-            .unwrap_err();
+        let err = call_register_resource(state, submission).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(
