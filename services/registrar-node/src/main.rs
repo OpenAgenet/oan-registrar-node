@@ -903,11 +903,7 @@ async fn validate_controller_index(
     verification_method: &str,
 ) -> std::result::Result<(), String> {
     let controller_did = controller_document.id.as_str();
-    let registrar_routing_code = routing_code_from_did(&state.did)
-        .map_err(|_| "controller_routing_code_mismatch".to_owned())?;
-    let controller_routing_code = routing_code_from_did(controller_did)
-        .map_err(|_| "controller_routing_code_mismatch".to_owned())?;
-    if controller_routing_code != registrar_routing_code {
+    if validate_resource_routing_code(controller_did, &state.did).is_err() {
         return Err("controller_routing_code_mismatch".to_owned());
     }
     let projection = read_controller_index(state, controller_did, verification_method)
@@ -928,14 +924,6 @@ async fn validate_controller_index(
         return Err("controller_verification_method_mismatch".to_owned());
     }
     Ok(())
-}
-
-fn routing_code_from_did(did: &str) -> std::result::Result<&str, ()> {
-    let mut parts = did.split(':');
-    if parts.next() != Some("did") || parts.next() != Some("oan") {
-        return Err(());
-    }
-    parts.next().ok_or(())
 }
 
 fn validate_resource_authorized_domains_for_registrar(
@@ -3425,7 +3413,7 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
         let mut submission = sample_submission();
-        let controller_did = "did:oan:P9aBc:9ControllerProofAccepted";
+        let controller_did = "did:oan:6HkPq:9ABCD123456789ABCDEFGHJKLMNPQRST";
         attach_external_controller_proof(&mut submission, controller_did);
         let controller_document = submission
             .controller_authorization_proof
@@ -3487,7 +3475,10 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:P9aBc:9ControllerNotIndexed");
+        attach_external_controller_proof(
+            &mut submission,
+            "did:oan:6HkPq:9ABCD123456789ABCDEFGHJKLMNPQRST",
+        );
 
         let controller_document = submission
             .controller_authorization_proof
@@ -3526,7 +3517,10 @@ mod tests {
         let mut state = app_state(dir.path());
         state.sqlite = Some(sqlite);
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:P9aBc:9ControllerPersisted");
+        attach_external_controller_proof(
+            &mut submission,
+            "did:oan:6HkPq:9JKLM123456789ABCDEFGHJKLMNPQRST",
+        );
         let bundle = submission.controller_authorization_proof.as_ref().unwrap();
         let controller_document = bundle.controller_did_document.clone();
         let verification_method = bundle.challenge.verification_method.clone();
@@ -3565,7 +3559,10 @@ mod tests {
         state.sqlite = Some(sqlite);
 
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:P9aBc:9ControllerBackfill");
+        attach_external_controller_proof(
+            &mut submission,
+            "did:oan:6HkPq:9NPQR123456789ABCDEFGHJKLMNPQRST",
+        );
         let document = submission
             .controller_authorization_proof
             .as_ref()
@@ -3593,9 +3590,9 @@ mod tests {
             .unwrap()
             .upsert_json(
                 "registrar.resource_records",
-                "did:oan:P9aBc:legacy-without-document",
+                "did:oan:6HkPq:9STUV123456789ABCDEFGHJKLMNPQRST",
                 &json!({
-                    "resourceDid": "did:oan:P9aBc:legacy-without-document",
+                    "resourceDid": "did:oan:6HkPq:9STUV123456789ABCDEFGHJKLMNPQRST",
                     "resourceType": "skill"
                 }),
             )
@@ -3616,12 +3613,14 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        assert!(
-            read_controller_index(&state, "did:oan:P9aBc:legacy-without-document", &method)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(read_controller_index(
+            &state,
+            "did:oan:6HkPq:9STUV123456789ABCDEFGHJKLMNPQRST",
+            &method,
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
@@ -3635,7 +3634,10 @@ mod tests {
         state.sqlite = Some(sqlite);
 
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:P9aBc:9ControllerResume");
+        attach_external_controller_proof(
+            &mut submission,
+            "did:oan:6HkPq:9WXYZ123456789ABCDEFGHJKLMNPQRST",
+        );
         let document = submission
             .controller_authorization_proof
             .as_ref()
@@ -3658,7 +3660,7 @@ mod tests {
             .await
             .unwrap();
         for index in 0..500 {
-            let did = format!("did:oan:P9aBc:legacy-{index:03}");
+            let did = format!("did:oan:6HkPq:8ABCD123456789ABCDEFGHJKLMNPQ{index:02}");
             state
                 .sqlite
                 .as_ref()
@@ -3703,7 +3705,7 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = format!("http://{addr}");
         let mut submission = sample_submission();
-        let controller_did = "did:oan:P9aBc:9ControllerReplay";
+        let controller_did = "did:oan:6HkPq:8EFGH123456789ABCDEFGHJKLMNPQRST";
         attach_external_controller_proof(&mut submission, controller_did);
         let controller_document = submission
             .controller_authorization_proof
@@ -3731,7 +3733,10 @@ mod tests {
         write_registrar_document(&state, vec!["legal".to_owned()]);
         state.config.upstream.root_endpoint = "http://127.0.0.1:1".to_owned();
         let mut submission = sample_submission();
-        attach_external_controller_proof(&mut submission, "did:oan:P9aBc:9ControllerProofTampered");
+        attach_external_controller_proof(
+            &mut submission,
+            "did:oan:6HkPq:8JKLM123456789ABCDEFGHJKLMNPQRST",
+        );
         submission
             .controller_authorization_proof
             .as_mut()
