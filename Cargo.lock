@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "oan-core"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "base64 0.22.1",
  "bs58 0.5.1",
@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "oan-credentials"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "bs58 0.5.1",
  "chrono",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "oan-crypto"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "base64 0.22.1",
  "bs58 0.5.1",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "oan-did-oan"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "bs58 0.5.1",
  "rand 0.8.6",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "oan-package"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "chrono",
  "oan-core",
@@ -2835,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "oan-protocol"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "chrono",
  "oan-core",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "oan-semantic-recommender"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "oan-core",
  "regex",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "oan-service-security"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "oan-storage"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "futures-util",
  "serde",
@@ -3518,7 +3518,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "registrar-node"
-version = "1.0.1"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "axum",
